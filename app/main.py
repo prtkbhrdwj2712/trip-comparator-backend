@@ -47,12 +47,18 @@ async def receive_plan_baseline(
         raise HTTPException(status_code=400, detail=f"Could not parse workbook: {e}")
 
     upserted = []
+    skipped_existing = []
     for trip_id, t in trips.items():
         existing = db.get(TripBaseline, trip_id)
         if existing:
-            db.query(StopBaseline).filter(StopBaseline.trip_id == trip_id).delete()
-            db.delete(existing)
-            db.flush()
+            # Baseline is write-once: the FIRST time we see a trip_id, that's
+            # locked in as "what was planned". If this same webhook fires
+            # again later for the same plan (re-optimization, a retry, or
+            # because the source endpoint started returning updated/
+            # post-confirmation data), we must NOT overwrite it - doing so
+            # would silently destroy the planned-vs-confirmed diff.
+            skipped_existing.append(trip_id)
+            continue
 
         row = TripBaseline(
             trip_id=trip_id,
@@ -89,7 +95,11 @@ async def receive_plan_baseline(
         upserted.append(trip_id)
 
     db.commit()
-    return {"status": "ok", "trips_ingested": upserted}
+    return {
+        "status": "ok",
+        "trips_ingested": upserted,
+        "trips_skipped_already_had_baseline": skipped_existing,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -205,6 +215,29 @@ def get_trip(trip_id: str, db: Session = Depends(get_db)):
         },
         "diff": diff,
     }
+
+
+@app.delete("/admin/trips/{trip_id}")
+def reset_trip(trip_id: str, db: Session = Depends(get_db), _auth: bool = Depends(verify_api_key)):
+    """
+    Manually wipe a trip's baseline + confirmed rows. Use this to clear out
+    test data, or to intentionally let a trip re-ingest a fresh baseline
+    (bypassing the normal write-once protection) if you're certain that's
+    what you want.
+    """
+    b = db.get(TripBaseline, trip_id)
+    c = db.get(TripConfirmed, trip_id)
+    if not b and not c:
+        raise HTTPException(status_code=404, detail="No baseline or confirmed record found for this trip_id")
+
+    if b:
+        db.query(StopBaseline).filter(StopBaseline.trip_id == trip_id).delete()
+        db.delete(b)
+    if c:
+        db.query(StopConfirmed).filter(StopConfirmed.trip_id == trip_id).delete()
+        db.delete(c)
+    db.commit()
+    return {"status": "ok", "trip_id": trip_id, "cleared_baseline": bool(b), "cleared_confirmed": bool(c)}
 
 
 @app.get("/health")
