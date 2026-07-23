@@ -1,13 +1,13 @@
 import io
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
-from fastapi import FastAPI, UploadFile, File, Depends, Body, HTTPException
+from fastapi import FastAPI, UploadFile, File, Form, Depends, Body, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
 
 from .database import init_db, get_db
-from .models import TripBaseline, StopBaseline, TripConfirmed, StopConfirmed
+from .models import TripBaseline, StopBaseline, TripConfirmed, StopConfirmed, PendingReconfirm
 from .xlsx_parser import parse_dispatch_workbook
 from .diff_engine import compute_diff
 from .auth import verify_api_key
@@ -240,6 +240,152 @@ def reset_trip(trip_id: str, db: Session = Depends(get_db), _auth: bool = Depend
     return {"status": "ok", "trip_id": trip_id, "cleared_baseline": bool(b), "cleared_confirmed": bool(c)}
 
 
+# ---------------------------------------------------------------------------
+# 4. POLLING-BASED CONFIRMATION (no CPI webhook available)
+#    Since a real "Trip Confirmed" event can't be wired in, we instead:
+#      a) register every baselined plan here as "pending recheck"
+#      b) a scheduled job (Render Cron) periodically asks what's due
+#      c) that job re-downloads the plan and posts it to /webhooks/plan-reconfirm
+#      d) we only treat a trip as confirmed if its own `status` column says so
+# ---------------------------------------------------------------------------
+RECHECK_INTERVAL_MINUTES = 15   # don't re-check the same plan more than this often
+FIRST_CHECK_DELAY_MINUTES = 60  # don't bother checking until this long after baseline
+GIVE_UP_AFTER_HOURS = 24        # stop rechecking a plan after this long either way
+
+
+@app.post("/internal/register-pending-reconfirm")
+def register_pending_reconfirm(
+    payload: dict = Body(...),
+    db: Session = Depends(get_db),
+    _auth: bool = Depends(verify_api_key),
+):
+    plan_id = payload.get("plan_id")
+    hierarchy = payload.get("hierarchy")
+    hierarchy_id = payload.get("hierarchy_id")
+    if not plan_id or not hierarchy or not hierarchy_id:
+        raise HTTPException(status_code=400, detail="plan_id, hierarchy, and hierarchy_id are all required")
+
+    existing = db.get(PendingReconfirm, plan_id)
+    if existing:
+        # Already tracking this plan - don't reset its clock.
+        return {"status": "ok", "already_tracked": True, "plan_id": plan_id}
+
+    row = PendingReconfirm(plan_id=plan_id, hierarchy=hierarchy, hierarchy_id=hierarchy_id)
+    db.add(row)
+    db.commit()
+    return {"status": "ok", "already_tracked": False, "plan_id": plan_id}
+
+
+@app.get("/internal/due-reconfirms")
+def due_reconfirms(db: Session = Depends(get_db), _auth: bool = Depends(verify_api_key)):
+    now = datetime.now(timezone.utc)
+    candidates = db.query(PendingReconfirm).filter(PendingReconfirm.done == 0).all()
+
+    due = []
+    for p in candidates:
+        first_dl = _as_utc(p.first_downloaded_at)
+        if now - first_dl < timedelta(minutes=FIRST_CHECK_DELAY_MINUTES):
+            continue
+        if now - first_dl > timedelta(hours=GIVE_UP_AFTER_HOURS):
+            p.done = 1  # give up - stop checking a plan forever
+            continue
+        if p.last_checked_at is not None:
+            last = _as_utc(p.last_checked_at)
+            if now - last < timedelta(minutes=RECHECK_INTERVAL_MINUTES):
+                continue
+        due.append({"plan_id": p.plan_id, "hierarchy": p.hierarchy, "hierarchy_id": p.hierarchy_id})
+
+    db.commit()  # persist any give-up flags set above
+    return {"due": due}
+
+
+@app.post("/webhooks/plan-reconfirm")
+async def receive_plan_reconfirm(
+    plan_id: str = Form(...),
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+    _auth: bool = Depends(verify_api_key),
+):
+    """
+    Receives a re-downloaded dispatch summary for a plan already being
+    tracked. Only trips whose own `status` column has moved past "Planned"
+    are treated as confirmed - everything else is left alone until a later
+    recheck.
+    """
+    content = await file.read()
+    try:
+        trips = parse_dispatch_workbook(io.BytesIO(content))
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Could not parse workbook: {e}")
+
+    newly_confirmed = []
+    still_planned = []
+
+    for trip_id, t in trips.items():
+        status = (t.get("status") or "").strip().lower()
+        if status == "planned" or status == "":
+            still_planned.append(trip_id)
+            continue
+
+        # This trip has moved past "Planned" - record/refresh its confirmed snapshot.
+        existing = db.get(TripConfirmed, trip_id)
+        if existing:
+            db.query(StopConfirmed).filter(StopConfirmed.trip_id == trip_id).delete()
+            db.delete(existing)
+            db.flush()
+
+        row = TripConfirmed(
+            trip_id=trip_id,
+            plan_id=t.get("plan_id"),
+            event_type=t.get("status"),
+            vehicle_category=t.get("vehicle_category"),
+            vehicle_id=t.get("vehicle_id"),
+            driver_name=t.get("driver_name"),
+            actual_trip_distance_km=_to_float(t.get("trip_distance_km")),
+            actual_trip_duration_h=_to_float(t.get("trip_duration_h")),
+            trip_weight_kg=_to_float(t.get("trip_weight_kg")),
+            trip_volume_cm3=_to_float(t.get("trip_volume_cm3")),
+            weight_utilization=_to_float(t.get("weight_utilization")),
+            space_utilization=_to_float(t.get("space_utilization")),
+            distance_utilization=_to_float(t.get("distance_utilization")),
+            time_utilization=_to_float(t.get("time_utilization")),
+            trip_cost=_to_float(t.get("trip_cost")),
+            no_of_stops=t.get("no_of_stops"),
+            raw=t,
+        )
+        db.add(row)
+        db.flush()
+        for s in t["stops"]:
+            db.add(StopConfirmed(
+                trip_id=trip_id,
+                activity=s.get("activity"),
+                ship_to_code=s.get("ship_to_code"),
+                ship_to_name=s.get("ship_to_name"),
+                sequence=_to_float(s.get("sequence")),
+                actual_arrival=s.get("arrival"),
+                weight_kg=_to_float(s.get("weight_kg")),
+            ))
+        newly_confirmed.append(trip_id)
+
+    # Update the tracker: mark done if nothing is still Planned, otherwise
+    # just record that we checked, so the next scheduled check waits its
+    # normal interval rather than hammering this plan repeatedly.
+    tracker = db.get(PendingReconfirm, plan_id)
+    if tracker:
+        tracker.last_checked_at = datetime.now(timezone.utc)
+        tracker.attempts = (tracker.attempts or 0) + 1
+        if not still_planned:
+            tracker.done = 1
+
+    db.commit()
+    return {
+        "status": "ok",
+        "plan_id": plan_id,
+        "newly_confirmed": newly_confirmed,
+        "still_planned": still_planned,
+    }
+
+
 @app.get("/health")
 def health():
     return {"status": "ok", "time": datetime.now(timezone.utc).isoformat()}
@@ -252,3 +398,12 @@ def _to_float(v):
         return float(v)
     except (TypeError, ValueError):
         return None
+
+
+def _as_utc(dt):
+    """Make sure a datetime is timezone-aware UTC before comparing/subtracting."""
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt
