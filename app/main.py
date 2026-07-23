@@ -308,9 +308,12 @@ async def receive_plan_reconfirm(
 ):
     """
     Receives a re-downloaded dispatch summary for a plan already being
-    tracked. Only trips whose own `status` column has moved past "Planned"
-    are treated as confirmed - everything else is left alone until a later
-    recheck.
+    tracked. Confirmed here just means "appears in this later export" -
+    the source system drops a trip out of the dispatch summary entirely
+    once it's confirmed, rather than flipping a status field on it. So
+    every trip found in this file is treated as confirmed; any baseline
+    trip for this plan_id that's NOT in this file is still pending and
+    gets left alone until the next scheduled recheck.
     """
     content = await file.read()
     try:
@@ -318,16 +321,19 @@ async def receive_plan_reconfirm(
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Could not parse workbook: {e}")
 
+    # The full set of trips we're expecting for this plan, from baseline.
+    baseline_trip_ids = {
+        row.trip_id for row in db.query(TripBaseline).filter(TripBaseline.plan_id == plan_id).all()
+    }
+
     newly_confirmed = []
-    still_planned = []
 
     for trip_id, t in trips.items():
-        status = (t.get("status") or "").strip().lower()
-        if status == "planned" or status == "":
-            still_planned.append(trip_id)
+        if trip_id not in baseline_trip_ids:
+            # A trip we've never seen baselined for this plan - ignore rather
+            # than guess; shouldn't normally happen.
             continue
 
-        # This trip has moved past "Planned" - record/refresh its confirmed snapshot.
         existing = db.get(TripConfirmed, trip_id)
         if existing:
             db.query(StopConfirmed).filter(StopConfirmed.trip_id == trip_id).delete()
@@ -337,7 +343,7 @@ async def receive_plan_reconfirm(
         row = TripConfirmed(
             trip_id=trip_id,
             plan_id=t.get("plan_id"),
-            event_type=t.get("status"),
+            event_type="Confirmed",
             vehicle_category=t.get("vehicle_category"),
             vehicle_id=t.get("vehicle_id"),
             driver_name=t.get("driver_name"),
@@ -367,9 +373,12 @@ async def receive_plan_reconfirm(
             ))
         newly_confirmed.append(trip_id)
 
-    # Update the tracker: mark done if nothing is still Planned, otherwise
-    # just record that we checked, so the next scheduled check waits its
-    # normal interval rather than hammering this plan repeatedly.
+    still_planned = sorted(baseline_trip_ids - set(newly_confirmed) - {
+        row.trip_id for row in db.query(TripConfirmed).filter(TripConfirmed.plan_id == plan_id).all()
+    })
+
+    # Update the tracker: mark done once every baseline trip for this plan
+    # has a confirmed record, otherwise just record that we checked.
     tracker = db.get(PendingReconfirm, plan_id)
     if tracker:
         tracker.last_checked_at = datetime.now(timezone.utc)
