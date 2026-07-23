@@ -1,92 +1,135 @@
 """
-Parses the dispatch-summary-style Excel file (same layout as the files used
-to build the first version of the dashboard) into plain dicts ready to be
-upserted into TripBaseline/StopBaseline or TripConfirmed/StopConfirmed.
+SQLAlchemy models.
 
-If the underlying export format ever changes, this is the one place to
-update - everything downstream (diff engine, API, dashboard) is unaffected
-as long as this keeps returning the same shape.
+Two "sides" of every trip are stored separately, exactly like the plan vs
+actual Excel files we started from:
+  - TripBaseline / StopBaseline  -> populated when the plan webhook fires
+  - TripConfirmed / StopConfirmed -> populated when the trip-events webhook fires
+
+Nothing is overwritten: if a trip gets re-confirmed (e.g. Trip Started then
+Trip Completed), we keep the latest confirmed snapshot per trip_id but you
+could just as easily version these if you want full history later.
 """
-import openpyxl
-from datetime import datetime
+from sqlalchemy import (
+    Column, String, Float, Integer, DateTime, ForeignKey, JSON
+)
+from sqlalchemy.orm import relationship, declarative_base
+from datetime import datetime, timezone
+
+Base = declarative_base()
 
 
-def _stringify(v):
-    if v is None:
-        return None
-    if isinstance(v, datetime):
-        return v.strftime("%Y-%m-%d %H:%M:%S")
-    return v
+def utcnow():
+    return datetime.now(timezone.utc)
 
 
-TRIP_FIELD_MAP = {
-    "plan id": "plan_id",
-    "trip id": "trip_id",
-    "trip name": "trip_name",
-    "trip date": "trip_date",
-    "vehicle category": "vehicle_category",
-    "vehicle id": "vehicle_id",
-    "driver name": "driver_name",
-    "planned trip distance(km)": "trip_distance_km",
-    "planned trip duration(h)": "trip_duration_h",
-    "trip weight(kg)": "trip_weight_kg",
-    "trip volume(cm3)": "trip_volume_cm3",
-    "weight utilization": "weight_utilization",
-    "space utilization": "space_utilization",
-    "distance utilization": "distance_utilization",
-    "time utilization": "time_utilization",
-    "Trip Cost": "trip_cost",
-}
+class TripBaseline(Base):
+    __tablename__ = "trip_baseline"
+
+    trip_id = Column(String, primary_key=True)
+    plan_id = Column(String, index=True, nullable=False)
+    trip_name = Column(String)
+    trip_date = Column(String)
+
+    vehicle_category = Column(String)
+    vehicle_id = Column(String)
+    driver_name = Column(String)
+
+    planned_trip_distance_km = Column(Float)
+    planned_trip_duration_h = Column(Float)
+    trip_weight_kg = Column(Float)
+    trip_volume_cm3 = Column(Float)
+
+    weight_utilization = Column(Float)
+    space_utilization = Column(Float)
+    distance_utilization = Column(Float)
+    time_utilization = Column(Float)
+
+    trip_cost = Column(Float, nullable=True)
+    no_of_stops = Column(Integer)
+
+    raw = Column(JSON)  # full row payload, for anything not modeled above
+    received_at = Column(DateTime, default=utcnow)
+
+    stops = relationship("StopBaseline", back_populates="trip", cascade="all, delete-orphan")
 
 
-def parse_dispatch_workbook(file_like):
+class StopBaseline(Base):
+    __tablename__ = "stop_baseline"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    trip_id = Column(String, ForeignKey("trip_baseline.trip_id"), index=True)
+
+    activity = Column(String)          # Pickup / Drop
+    ship_to_code = Column(String)      # dealer code -> used for the dealer diff
+    ship_to_name = Column(String)
+    sequence = Column(Float)
+    planned_arrival = Column(String)
+    weight_kg = Column(Float)
+
+    trip = relationship("TripBaseline", back_populates="stops")
+
+
+class TripConfirmed(Base):
+    __tablename__ = "trip_confirmed"
+
+    trip_id = Column(String, primary_key=True)
+    plan_id = Column(String, index=True, nullable=True)
+    event_type = Column(String)  # Trip Confirmed / Trip Started / Trip Completed
+
+    vehicle_category = Column(String)
+    vehicle_id = Column(String)
+    driver_name = Column(String)
+
+    actual_trip_distance_km = Column(Float, nullable=True)
+    actual_trip_duration_h = Column(Float, nullable=True)
+    trip_weight_kg = Column(Float)
+    trip_volume_cm3 = Column(Float, nullable=True)
+
+    weight_utilization = Column(Float)
+    space_utilization = Column(Float, nullable=True)
+    distance_utilization = Column(Float, nullable=True)
+    time_utilization = Column(Float, nullable=True)
+
+    trip_cost = Column(Float, nullable=True)
+    no_of_stops = Column(Integer)
+
+    raw = Column(JSON)
+    confirmed_at = Column(DateTime, default=utcnow)
+
+    stops = relationship("StopConfirmed", back_populates="trip", cascade="all, delete-orphan")
+
+
+class StopConfirmed(Base):
+    __tablename__ = "stop_confirmed"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    trip_id = Column(String, ForeignKey("trip_confirmed.trip_id"), index=True)
+
+    activity = Column(String)
+    ship_to_code = Column(String)
+    ship_to_name = Column(String)
+    sequence = Column(Float)
+    actual_arrival = Column(String)
+    weight_kg = Column(Float)
+
+    trip = relationship("TripConfirmed", back_populates="stops")
+
+
+class PendingReconfirm(Base):
     """
-    file_like: a file path or an in-memory binary stream (e.g. from an
-    uploaded multipart file).
-    Returns: dict[trip_id] -> {..trip fields.., "stops": [ {..stop..}, ... ]}
+    Tracks a plan that's been baselined and needs to be periodically
+    re-downloaded to see if any of its trips have moved past 'Planned'.
+    This exists because we don't have a real confirmation webhook - a
+    scheduled job re-checks these on an interval instead.
     """
-    wb = openpyxl.load_workbook(file_like, data_only=True)
-    ws = wb[wb.sheetnames[0]]
+    __tablename__ = "pending_reconfirm"
 
-    headers = [ws.cell(row=1, column=c).value for c in range(1, ws.max_column + 1)]
-    idx = {h: i for i, h in enumerate(headers)}
+    plan_id = Column(String, primary_key=True)
+    hierarchy = Column(String)
+    hierarchy_id = Column(String)
+    first_downloaded_at = Column(DateTime, default=utcnow)
+    last_checked_at = Column(DateTime, nullable=True)
+    attempts = Column(Integer, default=0)
+    done = Column(Integer, default=0)  # 0/1 - all trips for this plan confirmed, or gave up
 
-    required = ["trip id", "trip activity", "ship to (code)"]
-    for r in required:
-        if r not in idx:
-            raise ValueError(f"Expected column '{r}' not found in workbook headers: {headers}")
-
-    trips = {}
-    for row_num in range(2, ws.max_row + 1):
-        row = [ws.cell(row=row_num, column=c).value for c in range(1, ws.max_column + 1)]
-        tid = row[idx["trip id"]]
-        if tid is None:
-            continue
-
-        if tid not in trips:
-            t = {}
-            for src, dest in TRIP_FIELD_MAP.items():
-                if src in idx:
-                    t[dest] = _stringify(row[idx[src]])
-            t["stops"] = {}
-            trips[tid] = t
-
-        stop_code = row[idx["ship to (code)"]] or (row[idx["address"]] if "address" in idx else None)
-        activity = row[idx["trip activity"]]
-        key = f"{activity}_{stop_code}"
-        stops = trips[tid]["stops"]
-        if key not in stops:
-            stops[key] = {
-                "activity": activity,
-                "ship_to_code": stop_code,
-                "ship_to_name": _stringify(row[idx["ship to (name)"]]) if "ship to (name)" in idx else None,
-                "sequence": _stringify(row[idx["sequence"]]) if "sequence" in idx else None,
-                "arrival": _stringify(row[idx["planned arrival"]]) if "planned arrival" in idx else None,
-                "weight_kg": _stringify(row[idx["weight(kg)"]]) if "weight(kg)" in idx else None,
-            }
-
-    for tid, t in trips.items():
-        t["no_of_stops"] = len([k for k in t["stops"] if k.startswith("Drop")])
-        t["stops"] = list(t["stops"].values())
-
-    return trips
