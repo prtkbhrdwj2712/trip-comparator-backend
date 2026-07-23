@@ -114,3 +114,22 @@ class StopConfirmed(Base):
     weight_kg = Column(Float)
 
     trip = relationship("TripConfirmed", back_populates="stops")
+
+
+class PendingReconfirm(Base):
+    """
+    Tracks a plan that's been baselined and needs to be periodically
+    re-downloaded to see if any of its trips have moved past 'Planned'.
+    This exists because we don't have a real confirmation webhook - a
+    scheduled job re-checks these on an interval instead.
+    """
+    __tablename__ = "pending_reconfirm"
+
+    plan_id = Column(String, primary_key=True)
+    hierarchy = Column(String)
+    hierarchy_id = Column(String)
+    first_downloaded_at = Column(DateTime, default=utcnow)
+    last_checked_at = Column(DateTime, nullable=True)
+    attempts = Column(Integer, default=0)
+    done = Column(Integer, default=0)  # 0/1 - all trips for this plan confirmed, or gave up
+
