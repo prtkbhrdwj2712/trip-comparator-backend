@@ -30,6 +30,7 @@ class TripBaseline(Base):
     plan_id = Column(String, index=True, nullable=False)
     trip_name = Column(String)
     trip_date = Column(String)
+    dc_name = Column(String, nullable=True, index=True)  # e.g. "Bhandup" - passed by the uploader, not the xlsx itself
 
     vehicle_category = Column(String)
     vehicle_id = Column(String)
