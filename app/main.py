@@ -293,6 +293,68 @@ def get_stats(db: Session = Depends(get_db)):
     }
 
 
+@app.get("/internal/pending-reconfirm-status/{plan_id}")
+def pending_reconfirm_status(plan_id: str, db: Session = Depends(get_db), _auth: bool = Depends(verify_api_key)):
+    """
+    Diagnostic: shows exactly why a plan is (or isn't) being polled for
+    confirmation - whether it's registered at all, when it was first seen,
+    when it was last checked, and roughly when the next check is due.
+    Use this whenever a trip seems like it should have confirmed by now
+    but the dashboard still shows "awaiting".
+    """
+    tracker = db.get(PendingReconfirm, plan_id)
+    baseline_count = db.query(TripBaseline).filter(TripBaseline.plan_id == plan_id).count()
+    confirmed_count = (
+        db.query(TripConfirmed)
+        .join(TripBaseline, TripConfirmed.trip_id == TripBaseline.trip_id)
+        .filter(TripBaseline.plan_id == plan_id)
+        .count()
+    )
+
+    if not tracker:
+        return {
+            "plan_id": plan_id,
+            "registered_for_polling": False,
+            "explanation": (
+                "This plan was never registered for confirmation polling. "
+                "This usually means the baseline webhook's background call to "
+                "register-pending-reconfirm failed silently (e.g. a network "
+                "hiccup) when this plan was first ingested. It will never be "
+                "auto-checked unless manually registered."
+            ),
+            "baseline_trip_count": baseline_count,
+            "confirmed_trip_count": confirmed_count,
+        }
+
+    now = datetime.now(timezone.utc)
+    first_dl = _as_utc(tracker.first_downloaded_at)
+    last_checked = _as_utc(tracker.last_checked_at) if tracker.last_checked_at else None
+
+    age_minutes = (now - first_dl).total_seconds() / 60
+    if tracker.done:
+        status_explanation = "Marked done - either all trips confirmed, or gave up after 24 hours."
+    elif age_minutes < FIRST_CHECK_DELAY_MINUTES:
+        status_explanation = f"Too new - first check happens {FIRST_CHECK_DELAY_MINUTES} min after baseline; only {age_minutes:.0f} min have passed."
+    elif last_checked and (now - last_checked).total_seconds() / 60 < RECHECK_INTERVAL_MINUTES:
+        mins_since_check = (now - last_checked).total_seconds() / 60
+        status_explanation = f"Recently checked {mins_since_check:.0f} min ago - waits {RECHECK_INTERVAL_MINUTES} min between checks."
+    else:
+        status_explanation = "Due for a check now - should be picked up on the next cron run."
+
+    return {
+        "plan_id": plan_id,
+        "registered_for_polling": True,
+        "done": bool(tracker.done),
+        "attempts_so_far": tracker.attempts,
+        "first_downloaded_at": tracker.first_downloaded_at.isoformat() if tracker.first_downloaded_at else None,
+        "last_checked_at": tracker.last_checked_at.isoformat() if tracker.last_checked_at else None,
+        "age_minutes": round(age_minutes, 1),
+        "baseline_trip_count": baseline_count,
+        "confirmed_trip_count": confirmed_count,
+        "explanation": status_explanation,
+    }
+
+
 @app.get("/api/trips/{trip_id}")
 def get_trip(trip_id: str, db: Session = Depends(get_db)):
     b = db.get(TripBaseline, trip_id)
