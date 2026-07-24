@@ -674,9 +674,10 @@ def create_dashboard_user(
     _auth: bool = Depends(verify_api_key),
 ):
     """
-    Creates a new dashboard user with a freshly generated, unique access key.
-    Body: {"name": "alice"}. Returns the key - this is the only time it's
-    shown in full going forward it's just referenced by name.
+    Creates a new dashboard user. Body: {"name": "alice", "access_key": "whatever-you-want"}.
+    access_key is optional - if you leave it out, a random secure one gets
+    generated for you instead. Set your own if you'd rather pick something
+    memorable than deal with a long generated string.
     """
     name = payload.get("name", "").strip()
     if not name:
@@ -686,16 +687,41 @@ def create_dashboard_user(
     if existing and not existing.revoked:
         raise HTTPException(status_code=400, detail=f"User '{name}' already exists and is active")
 
-    new_key = secrets.token_urlsafe(24)
+    custom_key = (payload.get("access_key") or "").strip()
+    new_key = custom_key if custom_key else secrets.token_urlsafe(24)
 
     if existing:
-        # Re-activating a previously revoked name with a brand new key.
+        # Re-activating a previously revoked name with a (possibly custom) new key.
         existing.access_key = new_key
         existing.revoked = 0
         existing.created_at = datetime.now(timezone.utc)
     else:
         db.add(DashboardUser(name=name, access_key=new_key))
 
+    db.commit()
+    return {"name": name, "access_key": new_key}
+
+
+@app.post("/admin/dashboard-users/{name}/set-key")
+def set_dashboard_user_key(
+    name: str,
+    payload: dict = Body(...),
+    db: Session = Depends(get_db),
+    _auth: bool = Depends(verify_api_key),
+):
+    """
+    Changes an existing user's access key - to something you choose, or
+    leave access_key blank to get a fresh random one instead. Use this to
+    fix a hard-to-type generated key without deleting and recreating the
+    user (which would also reset their 2FA setup).
+    """
+    user = db.get(DashboardUser, name)
+    if not user:
+        raise HTTPException(status_code=404, detail=f"No dashboard user named '{name}'")
+
+    custom_key = (payload.get("access_key") or "").strip()
+    new_key = custom_key if custom_key else secrets.token_urlsafe(24)
+    user.access_key = new_key
     db.commit()
     return {"name": name, "access_key": new_key}
 
