@@ -1,9 +1,17 @@
 """
-Minimal shared-secret auth for the two inbound webhooks.
+Minimal shared-secret auth.
 
-Set WEBHOOK_API_KEY as an environment variable on Render, and configure the
-same value as a header (e.g. `X-API-Key`) on the outbound call from your
-plan-uploader service and your Trip Events / SAP CPI flow.
+Two separate keys, kept deliberately distinct:
+  - WEBHOOK_API_KEY: for inbound webhooks and admin/internal endpoints
+    (unchanged from before).
+  - DASHBOARD_ACCESS_KEY: for the dashboard's own read endpoints
+    (/api/trips, /api/dcs, /api/stats). Kept separate so that if the
+    dashboard is ever shared more widely, that key can be rotated/shared
+    independently without touching the webhook integrations.
+
+Set both as environment variables on Render, and configure the matching
+value as a header on the relevant caller (e.g. `X-API-Key` on the
+plan-uploader's calls, `X-Dashboard-Key` on the dashboard's fetch calls).
 
 This is intentionally simple - a static shared secret, checked on every
 request - rather than the full OAuth2 client-credentials flow shown in the
@@ -16,9 +24,16 @@ import os
 from fastapi import Header, HTTPException
 
 API_KEY = os.environ.get("WEBHOOK_API_KEY", "change-me-before-deploying")
+DASHBOARD_KEY = os.environ.get("DASHBOARD_ACCESS_KEY", "change-me-before-deploying")
 
 
 def verify_api_key(x_api_key: str = Header(None)):
     if x_api_key != API_KEY:
         raise HTTPException(status_code=401, detail="Invalid or missing X-API-Key header")
+    return True
+
+
+def verify_dashboard_key(x_dashboard_key: str = Header(None)):
+    if x_dashboard_key != DASHBOARD_KEY:
+        raise HTTPException(status_code=401, detail="Invalid or missing X-Dashboard-Key header")
     return True
