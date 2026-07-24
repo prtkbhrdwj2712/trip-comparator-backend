@@ -83,8 +83,17 @@ def parse_dispatch_workbook(file_like):
                 "ship_to_name": _stringify(row[idx["ship to (name)"]]) if "ship to (name)" in idx else None,
                 "sequence": _stringify(row[idx["sequence"]]) if "sequence" in idx else None,
                 "arrival": _stringify(row[idx["planned arrival"]]) if "planned arrival" in idx else None,
-                "weight_kg": _stringify(row[idx["weight(kg)"]]) if "weight(kg)" in idx else None,
+                "reference_order_number": _stringify(row[idx["reference order number"]]) if "reference order number" in idx else None,
+                "weight_kg": 0.0,
             }
+        # weight(kg) is a per-SKU-line value - a stop has one row per SKU
+        # line, so the true weight delivered at this stop is the SUM across
+        # all its lines, not just whichever row happened to be seen first
+        # (that was a latent bug - only the first line's weight was kept).
+        if "weight(kg)" in idx:
+            line_weight = row[idx["weight(kg)"]]
+            if isinstance(line_weight, (int, float)):
+                stops[key]["weight_kg"] += line_weight
 
     for tid, t in trips.items():
         t["no_of_stops"] = len([k for k in t["stops"] if k.startswith("Drop")])
