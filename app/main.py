@@ -92,6 +92,7 @@ async def receive_plan_baseline(
                 ship_to_name=s.get("ship_to_name"),
                 sequence=_to_float(s.get("sequence")),
                 planned_arrival=s.get("arrival"),
+                reference_order_number=s.get("reference_order_number"),
                 weight_kg=_to_float(s.get("weight_kg")),
             ))
         upserted.append(trip_id)
@@ -159,6 +160,7 @@ async def receive_trip_confirmed(
             ship_to_name=s.get("ship_to_name") or s.get("dealerName"),
             sequence=_to_float(s.get("sequence")),
             actual_arrival=s.get("actual_arrival") or s.get("arrivalTime"),
+            reference_order_number=s.get("reference_order_number"),
             weight_kg=_to_float(s.get("weight_kg")),
         ))
     db.commit()
@@ -372,10 +374,12 @@ def get_trip(trip_id: str, db: Session = Depends(get_db)):
             "driver_name": b.driver_name,
             "weight_utilization": b.weight_utilization,
             "trip_weight_kg": b.trip_weight_kg,
+            "trip_cost": b.trip_cost,
             "no_of_stops": b.no_of_stops,
             "stops": [
                 {"code": s.ship_to_code, "name": s.ship_to_name, "sequence": s.sequence,
-                 "arrival": s.planned_arrival}
+                 "arrival": s.planned_arrival, "reference_order_number": s.reference_order_number,
+                 "weight_kg": s.weight_kg}
                 for s in b.stops if s.activity == "Drop"
             ],
         },
@@ -385,10 +389,12 @@ def get_trip(trip_id: str, db: Session = Depends(get_db)):
             "driver_name": confirmed.driver_name,
             "weight_utilization": confirmed.weight_utilization,
             "trip_weight_kg": confirmed.trip_weight_kg,
+            "trip_cost": confirmed.trip_cost,
             "no_of_stops": confirmed.no_of_stops,
             "stops": [
                 {"code": s.ship_to_code, "name": s.ship_to_name, "sequence": s.sequence,
-                 "arrival": s.actual_arrival}
+                 "arrival": s.actual_arrival, "reference_order_number": s.reference_order_number,
+                 "weight_kg": s.weight_kg}
                 for s in confirmed.stops if s.activity == "Drop"
             ],
         },
@@ -600,6 +606,7 @@ async def receive_plan_reconfirm(
                 ship_to_name=s.get("ship_to_name"),
                 sequence=_to_float(s.get("sequence")),
                 actual_arrival=s.get("arrival"),
+                reference_order_number=s.get("reference_order_number"),
                 weight_kg=_to_float(s.get("weight_kg")),
             ))
         newly_confirmed.append(trip_id)
