@@ -368,6 +368,7 @@ def get_trip(trip_id: str, db: Session = Depends(get_db)):
         "trip_id": trip_id,
         "plan_id": b.plan_id,
         "trip_name": b.trip_name,
+        "dc_name": b.dc_name,
         "baseline": {
             "vehicle_category": b.vehicle_category,
             "vehicle_id": b.vehicle_id,
