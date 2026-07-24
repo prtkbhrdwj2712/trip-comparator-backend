@@ -8,7 +8,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
 
 from .database import init_db, get_db
-from .models import TripBaseline, StopBaseline, TripConfirmed, StopConfirmed, PendingReconfirm, DashboardUser, GeocodeCache, VehicleTransporter
+from .models import TripBaseline, StopBaseline, TripConfirmed, StopConfirmed, PendingReconfirm, DashboardUser, GeocodeCache, VehicleTransporter, DealerLocation
 from .xlsx_parser import parse_dispatch_workbook
 from .diff_engine import compute_diff
 from .auth import verify_api_key, verify_dashboard_key
@@ -509,6 +509,66 @@ def delete_vehicle_transporter(vehicle_id: str, db: Session = Depends(get_db), _
     return {"status": "ok", "vehicle_id": vehicle_id, "deleted": True}
 
 
+# ---------------------------------------------------------------------------
+# DEALER LOCATIONS (authoritative, supplied directly)
+#    Checked first by the map endpoint, before falling back to free
+#    Nominatim geocoding. Keyed by dealer_code, matching ship_to_code.
+# ---------------------------------------------------------------------------
+@app.post("/admin/dealer-locations/bulk")
+def bulk_upsert_dealer_locations(
+    payload: dict = Body(...),
+    db: Session = Depends(get_db),
+    _auth: bool = Depends(verify_api_key),
+):
+    """Body: {"mappings": [{"dealer_code": "594242", "latitude": 19.07, "longitude": 72.87, "dealer_name": "..."}, ...]}"""
+    mappings = payload.get("mappings", [])
+    created = 0
+    updated = 0
+    skipped = 0
+    for m in mappings:
+        dealer_code = str(m.get("dealer_code") or "").strip()
+        lat = m.get("latitude")
+        lng = m.get("longitude")
+        if not dealer_code or lat is None or lng is None:
+            skipped += 1
+            continue
+        existing = db.get(DealerLocation, dealer_code)
+        if existing:
+            existing.latitude = lat
+            existing.longitude = lng
+            existing.dealer_name = m.get("dealer_name") or existing.dealer_name
+            existing.updated_at = datetime.now(timezone.utc)
+            updated += 1
+        else:
+            db.add(DealerLocation(
+                dealer_code=dealer_code, latitude=lat, longitude=lng,
+                dealer_name=m.get("dealer_name"),
+            ))
+            created += 1
+    db.commit()
+    return {"status": "ok", "created": created, "updated": updated, "skipped_invalid": skipped}
+
+
+@app.get("/admin/dealer-locations")
+def list_dealer_locations(db: Session = Depends(get_db), _auth: bool = Depends(verify_api_key)):
+    rows = db.query(DealerLocation).order_by(DealerLocation.dealer_code).all()
+    return [
+        {"dealer_code": r.dealer_code, "latitude": r.latitude, "longitude": r.longitude,
+         "dealer_name": r.dealer_name, "updated_at": r.updated_at.isoformat() if r.updated_at else None}
+        for r in rows
+    ]
+
+
+@app.delete("/admin/dealer-locations/{dealer_code}")
+def delete_dealer_location(dealer_code: str, db: Session = Depends(get_db), _auth: bool = Depends(verify_api_key)):
+    row = db.get(DealerLocation, dealer_code)
+    if not row:
+        raise HTTPException(status_code=404, detail=f"No location for dealer '{dealer_code}'")
+    db.delete(row)
+    db.commit()
+    return {"status": "ok", "dealer_code": dealer_code, "deleted": True}
+
+
 @app.get("/api/trips/{trip_id}/map-data")
 def get_trip_map_data(trip_id: str, db: Session = Depends(get_db), _auth: bool = Depends(verify_dashboard_key)):
     """
@@ -532,7 +592,22 @@ def get_trip_map_data(trip_id: str, db: Session = Depends(get_db), _auth: bool =
     def resolve_points(stops):
         points = []
         for s in stops:
-            if s.activity != "Drop" or not s.address:
+            if s.activity != "Drop":
+                continue
+
+            # 1. Authoritative source first - real supplied coordinates,
+            #    keyed by dealer code (exact match, no ambiguity).
+            dealer_loc = db.get(DealerLocation, s.ship_to_code) if s.ship_to_code else None
+            if dealer_loc:
+                points.append({
+                    "code": s.ship_to_code, "name": s.ship_to_name,
+                    "sequence": s.sequence, "lat": dealer_loc.latitude, "lng": dealer_loc.longitude,
+                })
+                continue
+
+            # 2. Fall back to free-text geocoding only for dealers not in
+            #    the authoritative table.
+            if not s.address:
                 continue
             cached = db.get(GeocodeCache, s.address)
             if cached and cached.latitude is not None:
@@ -942,6 +1017,28 @@ async def receive_plan_reconfirm(
 @app.get("/health")
 def health():
     return {"status": "ok", "time": datetime.now(timezone.utc).isoformat()}
+
+
+@app.get("/internal/geocode-test")
+def geocode_test(address: str = "Mumbai, India", _auth: bool = Depends(verify_api_key)):
+    """
+    Diagnostic: tries geocoding a single address right now, bypassing the
+    cache entirely, and reports exactly what happened. Use this to tell
+    apart "Nominatim is reachable but this specific messy address doesn't
+    parse well" from "something's blocking geocoding entirely from Render".
+    Try the default (a simple, well-known place) first - if that also
+    fails, the problem isn't address quality, it's connectivity/blocking.
+    """
+    try:
+        lat, lng = geocode_module.geocode_address(address)
+        return {
+            "address_tried": address,
+            "resolved": lat is not None,
+            "lat": lat,
+            "lng": lng,
+        }
+    except Exception as e:
+        return {"address_tried": address, "resolved": False, "error": str(e)}
 
 
 # ---------------------------------------------------------------------------
