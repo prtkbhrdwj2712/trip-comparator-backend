@@ -66,6 +66,7 @@ class StopBaseline(Base):
     ship_to_name = Column(String)
     sequence = Column(Float)
     planned_arrival = Column(String)
+    reference_order_number = Column(String, nullable=True)
     weight_kg = Column(Float)
 
     trip = relationship("TripBaseline", back_populates="stops")
@@ -112,6 +113,7 @@ class StopConfirmed(Base):
     ship_to_name = Column(String)
     sequence = Column(Float)
     actual_arrival = Column(String)
+    reference_order_number = Column(String, nullable=True)
     weight_kg = Column(Float)
 
     trip = relationship("TripConfirmed", back_populates="stops")
