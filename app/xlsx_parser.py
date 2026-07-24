@@ -72,8 +72,19 @@ def parse_dispatch_workbook(file_like):
             t["stops"] = {}
             trips[tid] = t
 
-        stop_code = row[idx["ship to (code)"]] or (row[idx["address"]] if "address" in idx else None)
+        real_stop_code = row[idx["ship to (code)"]]
         activity = row[idx["trip activity"]]
+
+        if activity == "Drop" and not real_stop_code:
+            # A blank ship-to code on a Drop row is the vehicle's
+            # return-to-depot leg at the end of the route (its "dealer name"
+            # is always blank too) - not a real delivery stop. Previously
+            # this fell back to using the raw depot address as a fake dealer
+            # code, which inflated the dealer count and polluted the route
+            # view with a garbage "dealer". Skip it entirely.
+            continue
+
+        stop_code = real_stop_code
         key = f"{activity}_{stop_code}"
         stops = trips[tid]["stops"]
         if key not in stops:
