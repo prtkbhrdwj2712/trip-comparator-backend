@@ -149,9 +149,11 @@ class DashboardUser(Base):
     __tablename__ = "dashboard_user"
 
     name = Column(String, primary_key=True)
-    access_key = Column(String, unique=True, index=True, nullable=False)
+    access_key = Column(String, unique=True, index=True, nullable=False)  # stores a bcrypt hash, not plaintext
     created_at = Column(DateTime, default=utcnow)
     revoked = Column(Integer, default=0)  # 0/1 - revoked keys are kept (not deleted) for an audit trail
+    failed_login_attempts = Column(Integer, default=0)
+    locked_until = Column(DateTime, nullable=True)  # set after too many failed attempts; login rejected until this passes
     totp_secret = Column(String, nullable=True)  # set once the user completes 2FA setup; null = 2FA not enabled
 
 
@@ -200,4 +202,3 @@ class DealerLocation(Base):
     longitude = Column(Float, nullable=False)
     dealer_name = Column(String, nullable=True)
     updated_at = Column(DateTime, default=utcnow)
-
