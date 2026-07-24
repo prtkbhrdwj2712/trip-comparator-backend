@@ -455,6 +455,58 @@ def register_pending_reconfirm(
     return {"status": "ok", "already_tracked": False, "plan_id": plan_id}
 
 
+# Mirrors the uploader's HIERARCHY_MAP display names -> real hierarchy_id.
+# Needed here so we can bulk-backfill plans that were baselined before (or
+# despite) the registration call succeeding, without asking for each one
+# manually. If a new DC gets added on the uploader side, add it here too.
+KNOWN_DC_HIERARCHY_IDS = {
+    "Bhandup": "NGU4MmI1NjctMWVhMi0xMWYxLTkxNGEtMDAwZDNhMDE1NTA5",
+    "Mayapuri (1506)": "YWYzZWFhNDctMjk4YS0xMWVmLTg3NGItMDAwZDNhMDE1NTA5",
+    "Chrompet": "ZWJhMjMzMDAtMWRmMy0xMWYxLWExNTktMDAwZDNhMDYwMGQy",
+    "APIL Siliguri (1539)": "ZjY5MjVjMmItODA4NC0xMWVmLTg5NTEtMDAwZDNhMDYwMGQy",
+    "Life Care Logistic (1559)": "MjA1MmNjNzctMjk3ZS0xMWVmLTlhMWItMDAwZDNhMDYwMGQy",
+    "Karimnagar": "Njg3YzI5ZTgtMWUxNS0xMWYxLWExNTktMDAwZDNhMDYwMGQy",
+}
+
+
+@app.post("/internal/backfill-pending-reconfirm")
+def backfill_pending_reconfirm(db: Session = Depends(get_db), _auth: bool = Depends(verify_api_key)):
+    """
+    Finds every plan_id that has baseline trips but was never registered for
+    confirmation polling (the gap that's been causing "stuck on awaiting"
+    reports), and registers the ones we can - i.e. where dc_name is set and
+    matches a known DC. Plans with no dc_name (baselined before that field
+    existed) can't be auto-matched to a hierarchy_id and are reported
+    separately rather than guessed at.
+    """
+    all_plan_rows = (
+        db.query(TripBaseline.plan_id, TripBaseline.dc_name)
+        .distinct(TripBaseline.plan_id)
+        .all()
+    )
+    already_registered = {p.plan_id for p in db.query(PendingReconfirm.plan_id).all()}
+
+    registered = []
+    skipped_unknown_dc = []
+    for plan_id, dc_name in all_plan_rows:
+        if plan_id in already_registered:
+            continue
+        hierarchy_id = KNOWN_DC_HIERARCHY_IDS.get(dc_name) if dc_name else None
+        if not hierarchy_id:
+            skipped_unknown_dc.append({"plan_id": plan_id, "dc_name": dc_name})
+            continue
+        db.add(PendingReconfirm(plan_id=plan_id, hierarchy=dc_name, hierarchy_id=hierarchy_id))
+        registered.append({"plan_id": plan_id, "dc_name": dc_name})
+
+    db.commit()
+    return {
+        "newly_registered_count": len(registered),
+        "newly_registered": registered,
+        "skipped_unknown_dc_count": len(skipped_unknown_dc),
+        "skipped_unknown_dc": skipped_unknown_dc,
+    }
+
+
 @app.get("/internal/due-reconfirms")
 def due_reconfirms(db: Session = Depends(get_db), _auth: bool = Depends(verify_api_key)):
     now = datetime.now(timezone.utc)
@@ -577,6 +629,92 @@ async def receive_plan_reconfirm(
 @app.get("/health")
 def health():
     return {"status": "ok", "time": datetime.now(timezone.utc).isoformat()}
+
+
+# ---------------------------------------------------------------------------
+# 5. DATA RETENTION - keep only a rolling recent window
+#    Deletes trips (and everything linked to them) older than N days, based
+#    on trip_date. Defaults to a DRY RUN that reports what would be deleted
+#    without touching anything - pass confirm=true to actually delete.
+#    This is irreversible, so the dry-run default is intentional and should
+#    stay that way even if this gets automated via a cron job later.
+# ---------------------------------------------------------------------------
+@app.post("/internal/cleanup-old-data")
+def cleanup_old_data(
+    days: int = 2,
+    confirm: bool = False,
+    db: Session = Depends(get_db),
+    _auth: bool = Depends(verify_api_key),
+):
+    cutoff_date = (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%Y-%m-%d")
+
+    old_trip_ids = [
+        row.trip_id for row in
+        db.query(TripBaseline.trip_id).filter(TripBaseline.trip_date < cutoff_date).all()
+    ]
+    old_plan_ids = sorted({
+        row.plan_id for row in
+        db.query(TripBaseline.plan_id).filter(TripBaseline.trip_date < cutoff_date).distinct().all()
+    })
+
+    if not old_trip_ids:
+        return {
+            "dry_run": not confirm,
+            "cutoff_date": cutoff_date,
+            "message": f"Nothing older than {cutoff_date} found - already clean.",
+            "trips_affected": 0,
+            "plans_affected": 0,
+        }
+
+    if not confirm:
+        return {
+            "dry_run": True,
+            "cutoff_date": cutoff_date,
+            "message": "This is a preview only - nothing was deleted. Re-run with confirm=true to actually delete.",
+            "trips_affected": len(old_trip_ids),
+            "plans_affected": len(old_plan_ids),
+            "sample_plan_ids": old_plan_ids[:10],
+        }
+
+    # Actual deletion, in dependency order, using bulk SQL deletes (not
+    # loading each row as a Python object) so this stays memory-safe even
+    # for a large cleanup - same lesson learned from the OOM issue earlier.
+    stop_baseline_deleted = (
+        db.query(StopBaseline).filter(StopBaseline.trip_id.in_(old_trip_ids))
+        .delete(synchronize_session=False)
+    )
+    stop_confirmed_deleted = (
+        db.query(StopConfirmed).filter(StopConfirmed.trip_id.in_(old_trip_ids))
+        .delete(synchronize_session=False)
+    )
+    trip_confirmed_deleted = (
+        db.query(TripConfirmed).filter(TripConfirmed.trip_id.in_(old_trip_ids))
+        .delete(synchronize_session=False)
+    )
+    trip_baseline_deleted = (
+        db.query(TripBaseline).filter(TripBaseline.trip_id.in_(old_trip_ids))
+        .delete(synchronize_session=False)
+    )
+    pending_reconfirm_deleted = (
+        db.query(PendingReconfirm).filter(PendingReconfirm.plan_id.in_(old_plan_ids))
+        .delete(synchronize_session=False)
+    )
+    db.commit()
+
+    return {
+        "dry_run": False,
+        "cutoff_date": cutoff_date,
+        "message": f"Deleted all data with trip_date before {cutoff_date}.",
+        "trips_affected": len(old_trip_ids),
+        "plans_affected": len(old_plan_ids),
+        "rows_deleted": {
+            "trip_baseline": trip_baseline_deleted,
+            "stop_baseline": stop_baseline_deleted,
+            "trip_confirmed": trip_confirmed_deleted,
+            "stop_confirmed": stop_confirmed_deleted,
+            "pending_reconfirm": pending_reconfirm_deleted,
+        },
+    }
 
 
 def _to_float(v):
