@@ -67,6 +67,7 @@ class StopBaseline(Base):
     sequence = Column(Float)
     planned_arrival = Column(String)
     reference_order_number = Column(String, nullable=True)
+    address = Column(String, nullable=True)  # for geocoding into the route map
     weight_kg = Column(Float)
 
     trip = relationship("TripBaseline", back_populates="stops")
@@ -114,6 +115,7 @@ class StopConfirmed(Base):
     sequence = Column(Float)
     actual_arrival = Column(String)
     reference_order_number = Column(String, nullable=True)
+    address = Column(String, nullable=True)  # for geocoding into the route map
     weight_kg = Column(Float)
 
     trip = relationship("TripConfirmed", back_populates="stops")
@@ -150,4 +152,34 @@ class DashboardUser(Base):
     access_key = Column(String, unique=True, index=True, nullable=False)
     created_at = Column(DateTime, default=utcnow)
     revoked = Column(Integer, default=0)  # 0/1 - revoked keys are kept (not deleted) for an audit trail
+    totp_secret = Column(String, nullable=True)  # set once the user completes 2FA setup; null = 2FA not enabled
+
+
+class GeocodeCache(Base):
+    """
+    Caches address -> lat/lng lookups so the same dealer address (which
+    repeats across many trips/plans) only ever gets geocoded once against
+    the free Nominatim service, which has a strict 1-request/second policy.
+    """
+    __tablename__ = "geocode_cache"
+
+    address = Column(String, primary_key=True)
+    latitude = Column(Float, nullable=True)
+    longitude = Column(Float, nullable=True)
+    looked_up_at = Column(DateTime, default=utcnow)
+
+
+class VehicleTransporter(Base):
+    """
+    A separately-maintained vehicle -> transporter lookup, since this isn't
+    in the dispatch summary data at all. Populated via /admin/vehicle-
+    transporters (bulk upload or one at a time), and used to enrich trip
+    responses by looking up whichever vehicle_id ended up on each side
+    (planned vehicle vs confirmed vehicle can be different transporters).
+    """
+    __tablename__ = "vehicle_transporter"
+
+    vehicle_id = Column(String, primary_key=True)
+    transporter_name = Column(String, nullable=False)
+    updated_at = Column(DateTime, default=utcnow)
 
