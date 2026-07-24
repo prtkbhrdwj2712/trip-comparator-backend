@@ -21,7 +21,10 @@ parity later (e.g. because of a security review), this is the one file that
 would need to grow into a proper OAuth2 token verifier.
 """
 import os
-from fastapi import Header, HTTPException
+from fastapi import Header, HTTPException, Depends
+from sqlalchemy.orm import Session
+
+from .database import get_db
 
 API_KEY = os.environ.get("WEBHOOK_API_KEY", "change-me-before-deploying")
 DASHBOARD_KEY = os.environ.get("DASHBOARD_ACCESS_KEY", "change-me-before-deploying")
@@ -33,7 +36,14 @@ def verify_api_key(x_api_key: str = Header(None)):
     return True
 
 
-def verify_dashboard_key(x_dashboard_key: str = Header(None)):
-    if x_dashboard_key != DASHBOARD_KEY:
-        raise HTTPException(status_code=401, detail="Invalid or missing X-Dashboard-Key header")
-    return True
+def verify_dashboard_key(x_dashboard_key: str = Header(None), db: Session = Depends(get_db)):
+    if x_dashboard_key == DASHBOARD_KEY:
+        return True
+    from .models import DashboardUser
+    user = db.query(DashboardUser).filter(
+        DashboardUser.access_key == x_dashboard_key,
+        DashboardUser.revoked == 0,
+    ).first()
+    if user:
+        return True
+    raise HTTPException(status_code=401, detail="Invalid or missing X-Dashboard-Key header")
