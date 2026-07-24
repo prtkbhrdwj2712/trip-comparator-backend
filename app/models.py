@@ -136,3 +136,18 @@ class PendingReconfirm(Base):
     attempts = Column(Integer, default=0)
     done = Column(Integer, default=0)  # 0/1 - all trips for this plan confirmed, or gave up
 
+
+class DashboardUser(Base):
+    """
+    Per-person dashboard access keys, on top of the single master
+    DASHBOARD_ACCESS_KEY env var (which keeps working regardless, as a
+    fallback that always works even if this table is empty or has issues).
+    Managed via /admin/dashboard-users, protected by WEBHOOK_API_KEY.
+    """
+    __tablename__ = "dashboard_user"
+
+    name = Column(String, primary_key=True)
+    access_key = Column(String, unique=True, index=True, nullable=False)
+    created_at = Column(DateTime, default=utcnow)
+    revoked = Column(Integer, default=0)  # 0/1 - revoked keys are kept (not deleted) for an audit trail
+
