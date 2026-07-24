@@ -15,14 +15,28 @@ TRIP_LEVEL_FIELDS = [
 ]
 
 
-def _dealer_keys(stops):
-    return {f"{s.activity}_{s.ship_to_code}" for s in stops if s.activity == "Drop"}
+def _dealer_keys_from_stops(stops):
+    """stops: list of simple dicts/tuples with .activity, .ship_to_code (or dict keys)."""
+    keys = set()
+    for s in stops:
+        activity = s["activity"] if isinstance(s, dict) else s.activity
+        code = s["ship_to_code"] if isinstance(s, dict) else s.ship_to_code
+        if activity == "Drop":
+            keys.add(f"{activity}_{code}")
+    return keys
 
 
-def compute_diff(baseline_trip, confirmed_trip):
+def compute_diff(baseline_trip, confirmed_trip, baseline_stops=None, confirmed_stops=None):
     """
-    baseline_trip: TripBaseline ORM instance (with .stops loaded)
-    confirmed_trip: TripConfirmed ORM instance (with .stops loaded), or None
+    baseline_trip: TripBaseline ORM instance
+    confirmed_trip: TripConfirmed ORM instance, or None
+    baseline_stops / confirmed_stops: optional pre-fetched lists of simple
+        dicts ({"activity", "ship_to_code", "ship_to_name"}) - pass these
+        when calling this for many trips at once (e.g. the /api/trips list)
+        to avoid triggering a lazy-load of the full .stops relationship for
+        every single trip, which is what was driving memory usage way up.
+        If omitted, falls back to the ORM relationship (fine for one-off
+        single-trip lookups like /api/trips/{trip_id}).
     """
     if confirmed_trip is None:
         return {"status": "awaiting_confirmation"}
@@ -40,17 +54,26 @@ def compute_diff(baseline_trip, confirmed_trip):
         if _norm(bv) != _norm(av):
             trip_diffs.append({"field": field, "label": label, "planned": bv, "confirmed": av})
 
-    b_keys = _dealer_keys(baseline_trip.stops)
-    a_keys = _dealer_keys(confirmed_trip.stops)
+    b_stops = baseline_stops if baseline_stops is not None else [
+        {"activity": s.activity, "ship_to_code": s.ship_to_code, "ship_to_name": s.ship_to_name}
+        for s in baseline_trip.stops
+    ]
+    a_stops = confirmed_stops if confirmed_stops is not None else [
+        {"activity": s.activity, "ship_to_code": s.ship_to_code, "ship_to_name": s.ship_to_name}
+        for s in confirmed_trip.stops
+    ]
+
+    b_keys = _dealer_keys_from_stops(b_stops)
+    a_keys = _dealer_keys_from_stops(a_stops)
 
     removed = b_keys - a_keys   # dealers in baseline, not in actual
     added = a_keys - b_keys     # dealers in actual, not in baseline
 
-    b_by_key = {f"{s.activity}_{s.ship_to_code}": s for s in baseline_trip.stops}
-    a_by_key = {f"{s.activity}_{s.ship_to_code}": s for s in confirmed_trip.stops}
+    b_by_key = {f"{s['activity']}_{s['ship_to_code']}": s for s in b_stops}
+    a_by_key = {f"{s['activity']}_{s['ship_to_code']}": s for s in a_stops}
 
-    removed_list = [{"code": b_by_key[k].ship_to_code, "name": b_by_key[k].ship_to_name} for k in removed]
-    added_list = [{"code": a_by_key[k].ship_to_code, "name": a_by_key[k].ship_to_name} for k in added]
+    removed_list = [{"code": b_by_key[k]["ship_to_code"], "name": b_by_key[k]["ship_to_name"]} for k in removed]
+    added_list = [{"code": a_by_key[k]["ship_to_code"], "name": a_by_key[k]["ship_to_name"]} for k in added]
 
     has_changes = bool(trip_diffs) or bool(removed) or bool(added)
 
