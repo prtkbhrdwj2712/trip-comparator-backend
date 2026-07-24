@@ -37,6 +37,7 @@ def on_startup():
 @app.post("/webhooks/plan-baseline")
 async def receive_plan_baseline(
     file: UploadFile = File(...),
+    hierarchy: str = Form(None),  # e.g. "Bhandup" - the friendly DC name, passed by the uploader
     db: Session = Depends(get_db),
     _auth: bool = Depends(verify_api_key),
 ):
@@ -65,6 +66,7 @@ async def receive_plan_baseline(
             plan_id=t.get("plan_id"),
             trip_name=t.get("trip_name"),
             trip_date=t.get("trip_date"),
+            dc_name=hierarchy,
             vehicle_category=t.get("vehicle_category"),
             vehicle_id=t.get("vehicle_id"),
             driver_name=t.get("driver_name"),
@@ -167,8 +169,24 @@ async def receive_trip_confirmed(
 # 3. DASHBOARD READ API
 # ---------------------------------------------------------------------------
 @app.get("/api/trips")
-def list_trips(db: Session = Depends(get_db)):
-    baselines = db.query(TripBaseline).all()
+def list_trips(
+    date_from: str = None,   # "YYYY-MM-DD" - inclusive
+    date_to: str = None,     # "YYYY-MM-DD" - inclusive
+    dc: str = None,          # exact dc_name match, e.g. "Bhandup"
+    db: Session = Depends(get_db),
+):
+    query = db.query(TripBaseline)
+    if date_from:
+        query = query.filter(TripBaseline.trip_date >= date_from)
+    if date_to:
+        # trip_date is stored as "YYYY-MM-DD" or "YYYY-MM-DD HH:MM:SS" - a
+        # simple string upper-bound of date_to + a character past any time
+        # component keeps this an inclusive same-day match either way.
+        query = query.filter(TripBaseline.trip_date <= f"{date_to} 23:59:59")
+    if dc:
+        query = query.filter(TripBaseline.dc_name == dc)
+
+    baselines = query.all()
     if not baselines:
         return []
 
@@ -221,9 +239,18 @@ def list_trips(db: Session = Depends(get_db)):
             "trip_id": b.trip_id,
             "plan_id": b.plan_id,
             "trip_name": b.trip_name,
+            "trip_date": b.trip_date,
+            "dc_name": b.dc_name,
             **diff,
         })
     return out
+
+
+@app.get("/api/dcs")
+def list_dcs(db: Session = Depends(get_db)):
+    """Distinct DC names seen so far, for populating the dashboard's filter dropdown."""
+    rows = db.query(TripBaseline.dc_name).filter(TripBaseline.dc_name.isnot(None)).distinct().all()
+    return sorted([r[0] for r in rows if r[0]])
 
 
 @app.get("/api/trips/{trip_id}")
