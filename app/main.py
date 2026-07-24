@@ -8,10 +8,12 @@ from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
 
 from .database import init_db, get_db
-from .models import TripBaseline, StopBaseline, TripConfirmed, StopConfirmed, PendingReconfirm, DashboardUser
+from .models import TripBaseline, StopBaseline, TripConfirmed, StopConfirmed, PendingReconfirm, DashboardUser, GeocodeCache, VehicleTransporter
 from .xlsx_parser import parse_dispatch_workbook
 from .diff_engine import compute_diff
 from .auth import verify_api_key, verify_dashboard_key
+from . import totp_utils
+from . import geocode as geocode_module
 
 app = FastAPI(title="Trip Comparator Backend")
 
@@ -94,6 +96,7 @@ async def receive_plan_baseline(
                 sequence=_to_float(s.get("sequence")),
                 planned_arrival=s.get("arrival"),
                 reference_order_number=s.get("reference_order_number"),
+                address=s.get("address"),
                 weight_kg=_to_float(s.get("weight_kg")),
             ))
         upserted.append(trip_id)
@@ -162,6 +165,7 @@ async def receive_trip_confirmed(
             sequence=_to_float(s.get("sequence")),
             actual_arrival=s.get("actual_arrival") or s.get("arrivalTime"),
             reference_order_number=s.get("reference_order_number"),
+            address=s.get("address"),
             weight_kg=_to_float(s.get("weight_kg")),
         ))
     db.commit()
@@ -366,6 +370,21 @@ def get_trip(trip_id: str, db: Session = Depends(get_db), _auth: bool = Depends(
         raise HTTPException(status_code=404, detail="Trip not found in baseline")
     confirmed = db.get(TripConfirmed, trip_id)
     diff = compute_diff(b, confirmed)
+
+    # Transporter isn't in the dispatch summary data at all - looked up
+    # separately from the vehicle_transporter table, maintained via
+    # /admin/vehicle-transporters. The planned and confirmed vehicle can be
+    # different vehicles entirely, so each side gets its own lookup.
+    baseline_transporter = None
+    if b.vehicle_id:
+        vt = db.get(VehicleTransporter, b.vehicle_id)
+        baseline_transporter = vt.transporter_name if vt else None
+
+    confirmed_transporter = None
+    if confirmed and confirmed.vehicle_id:
+        vt = db.get(VehicleTransporter, confirmed.vehicle_id)
+        confirmed_transporter = vt.transporter_name if vt else None
+
     return {
         "trip_id": trip_id,
         "plan_id": b.plan_id,
@@ -374,6 +393,7 @@ def get_trip(trip_id: str, db: Session = Depends(get_db), _auth: bool = Depends(
         "baseline": {
             "vehicle_category": b.vehicle_category,
             "vehicle_id": b.vehicle_id,
+            "transporter_name": baseline_transporter,
             "driver_name": b.driver_name,
             "weight_utilization": b.weight_utilization,
             "space_utilization": b.space_utilization,
@@ -393,6 +413,7 @@ def get_trip(trip_id: str, db: Session = Depends(get_db), _auth: bool = Depends(
         "confirmed": None if not confirmed else {
             "vehicle_category": confirmed.vehicle_category,
             "vehicle_id": confirmed.vehicle_id,
+            "transporter_name": confirmed_transporter,
             "driver_name": confirmed.driver_name,
             "weight_utilization": confirmed.weight_utilization,
             "space_utilization": confirmed.space_utilization,
@@ -410,6 +431,135 @@ def get_trip(trip_id: str, db: Session = Depends(get_db), _auth: bool = Depends(
             ],
         },
         "diff": diff,
+    }
+
+
+# ---------------------------------------------------------------------------
+# VEHICLE -> TRANSPORTER LOOKUP
+#    Not in the dispatch summary data at all - maintained separately here.
+#    Protected by WEBHOOK_API_KEY since it's admin data management, not a
+#    dashboard read.
+# ---------------------------------------------------------------------------
+@app.post("/admin/vehicle-transporters")
+def upsert_vehicle_transporter(
+    payload: dict = Body(...),
+    db: Session = Depends(get_db),
+    _auth: bool = Depends(verify_api_key),
+):
+    """Body: {"vehicle_id": "TN03AM4386", "transporter_name": "ABC Logistics"}. Creates or updates."""
+    vehicle_id = (payload.get("vehicle_id") or "").strip()
+    transporter_name = (payload.get("transporter_name") or "").strip()
+    if not vehicle_id or not transporter_name:
+        raise HTTPException(status_code=400, detail="vehicle_id and transporter_name are both required")
+
+    existing = db.get(VehicleTransporter, vehicle_id)
+    if existing:
+        existing.transporter_name = transporter_name
+        existing.updated_at = datetime.now(timezone.utc)
+    else:
+        db.add(VehicleTransporter(vehicle_id=vehicle_id, transporter_name=transporter_name))
+    db.commit()
+    return {"status": "ok", "vehicle_id": vehicle_id, "transporter_name": transporter_name}
+
+
+@app.post("/admin/vehicle-transporters/bulk")
+def bulk_upsert_vehicle_transporters(
+    payload: dict = Body(...),
+    db: Session = Depends(get_db),
+    _auth: bool = Depends(verify_api_key),
+):
+    """Body: {"mappings": [{"vehicle_id": "...", "transporter_name": "..."}, ...]}"""
+    mappings = payload.get("mappings", [])
+    updated = 0
+    created = 0
+    for m in mappings:
+        vehicle_id = (m.get("vehicle_id") or "").strip()
+        transporter_name = (m.get("transporter_name") or "").strip()
+        if not vehicle_id or not transporter_name:
+            continue
+        existing = db.get(VehicleTransporter, vehicle_id)
+        if existing:
+            existing.transporter_name = transporter_name
+            existing.updated_at = datetime.now(timezone.utc)
+            updated += 1
+        else:
+            db.add(VehicleTransporter(vehicle_id=vehicle_id, transporter_name=transporter_name))
+            created += 1
+    db.commit()
+    return {"status": "ok", "created": created, "updated": updated}
+
+
+@app.get("/admin/vehicle-transporters")
+def list_vehicle_transporters(db: Session = Depends(get_db), _auth: bool = Depends(verify_api_key)):
+    rows = db.query(VehicleTransporter).order_by(VehicleTransporter.vehicle_id).all()
+    return [
+        {"vehicle_id": r.vehicle_id, "transporter_name": r.transporter_name,
+         "updated_at": r.updated_at.isoformat() if r.updated_at else None}
+        for r in rows
+    ]
+
+
+@app.delete("/admin/vehicle-transporters/{vehicle_id}")
+def delete_vehicle_transporter(vehicle_id: str, db: Session = Depends(get_db), _auth: bool = Depends(verify_api_key)):
+    row = db.get(VehicleTransporter, vehicle_id)
+    if not row:
+        raise HTTPException(status_code=404, detail=f"No transporter mapping for vehicle '{vehicle_id}'")
+    db.delete(row)
+    db.commit()
+    return {"status": "ok", "vehicle_id": vehicle_id, "deleted": True}
+
+
+@app.get("/api/trips/{trip_id}/map-data")
+def get_trip_map_data(trip_id: str, db: Session = Depends(get_db), _auth: bool = Depends(verify_dashboard_key)):
+    """
+    Geocodes (with caching) every dealer address for this trip's baseline
+    and confirmed stops, and returns lat/lng points for plotting a route
+    map. Only ever calls the free Nominatim geocoder for addresses not
+    already in the cache - most calls after the first few weeks of real
+    usage should be pure cache hits, since dealer addresses repeat heavily
+    across trips.
+
+    This can be slow on first use for a trip with many never-seen-before
+    addresses (Nominatim's policy caps us at 1 request/second) - that's why
+    this is its own endpoint, only called when someone actually opens the
+    map, rather than something every trip list load has to wait on.
+    """
+    b = db.get(TripBaseline, trip_id)
+    if not b:
+        raise HTTPException(status_code=404, detail="Trip not found in baseline")
+    confirmed = db.get(TripConfirmed, trip_id)
+
+    def resolve_points(stops):
+        points = []
+        for s in stops:
+            if s.activity != "Drop" or not s.address:
+                continue
+            cached = db.get(GeocodeCache, s.address)
+            if cached and cached.latitude is not None:
+                lat, lng = cached.latitude, cached.longitude
+            elif cached:
+                # Previously looked up and failed to resolve - don't retry
+                # every single time; skip it.
+                continue
+            else:
+                lat, lng = geocode_module.geocode_address(s.address)
+                db.add(GeocodeCache(address=s.address, latitude=lat, longitude=lng))
+                db.commit()
+            if lat is not None:
+                points.append({
+                    "code": s.ship_to_code, "name": s.ship_to_name,
+                    "sequence": s.sequence, "lat": lat, "lng": lng,
+                })
+        points.sort(key=lambda p: p["sequence"] or 0)
+        return points
+
+    baseline_points = resolve_points(b.stops)
+    confirmed_points = resolve_points(confirmed.stops) if confirmed else []
+
+    return {
+        "trip_id": trip_id,
+        "baseline_points": baseline_points,
+        "confirmed_points": confirmed_points,
     }
 
 
@@ -503,6 +653,81 @@ def revoke_dashboard_user(name: str, db: Session = Depends(get_db), _auth: bool 
     user.revoked = 1
     db.commit()
     return {"status": "ok", "name": name, "revoked": True}
+
+
+@app.post("/admin/dashboard-users/{name}/enable-2fa")
+def enable_2fa(name: str, db: Session = Depends(get_db), _auth: bool = Depends(verify_api_key)):
+    """
+    Generates a new TOTP secret for this user and returns a QR code (base64
+    PNG) to scan into any standard authenticator app (Google Authenticator,
+    Authy, etc.). Once this is set, that user's login requires a 6-digit
+    code in addition to their access key.
+    """
+    user = db.get(DashboardUser, name)
+    if not user:
+        raise HTTPException(status_code=404, detail=f"No dashboard user named '{name}'")
+
+    secret = totp_utils.generate_secret()
+    user.totp_secret = secret
+    db.commit()
+
+    qr_b64 = totp_utils.get_provisioning_qr_code_base64(secret, name)
+    return {
+        "name": name,
+        "totp_secret": secret,  # shown once in case they need to enter it manually
+        "qr_code_base64": qr_b64,
+    }
+
+
+@app.post("/admin/dashboard-users/{name}/disable-2fa")
+def disable_2fa(name: str, db: Session = Depends(get_db), _auth: bool = Depends(verify_api_key)):
+    user = db.get(DashboardUser, name)
+    if not user:
+        raise HTTPException(status_code=404, detail=f"No dashboard user named '{name}'")
+    user.totp_secret = None
+    db.commit()
+    return {"status": "ok", "name": name, "totp_disabled": True}
+
+
+@app.post("/api/login")
+def dashboard_login(payload: dict = Body(...), db: Session = Depends(get_db)):
+    """
+    Real login check: validates that the given name+access_key belong
+    together (not just that the key is valid for SOME user), and enforces
+    a TOTP code if that user has 2FA enabled. The master DASHBOARD_ACCESS_KEY
+    still works as a no-username-needed fallback, same as before.
+
+    This endpoint itself isn't protected by verify_dashboard_key (that would
+    be circular) - it's the thing that decides whether the key the user is
+    about to use for real API calls is actually valid for them.
+    """
+    from .auth import DASHBOARD_KEY
+
+    name = (payload.get("name") or "").strip()
+    access_key = payload.get("access_key") or ""
+    totp_code = payload.get("totp_code")
+
+    if access_key == DASHBOARD_KEY:
+        return {"status": "ok", "requires_totp": False}
+
+    if not name:
+        raise HTTPException(status_code=400, detail="Username is required")
+
+    user = db.get(DashboardUser, name)
+    if not user or user.revoked or user.access_key != access_key:
+        raise HTTPException(status_code=401, detail="Incorrect username or access key")
+
+    if user.totp_secret:
+        if not totp_code:
+            # Correct username/key, but 2FA is required and no code was sent yet -
+            # the frontend should now show the code-entry step.
+            return {"status": "totp_required", "requires_totp": True}
+        if not totp_utils.verify_totp_code(user.totp_secret, totp_code):
+            raise HTTPException(status_code=401, detail="Incorrect 2FA code")
+
+    return {"status": "ok", "requires_totp": bool(user.totp_secret)}
+
+
 
 
 # ---------------------------------------------------------------------------
@@ -687,6 +912,7 @@ async def receive_plan_reconfirm(
                 sequence=_to_float(s.get("sequence")),
                 actual_arrival=s.get("arrival"),
                 reference_order_number=s.get("reference_order_number"),
+                address=s.get("address"),
                 weight_kg=_to_float(s.get("weight_kg")),
             ))
         newly_confirmed.append(trip_id)
