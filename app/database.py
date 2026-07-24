@@ -29,6 +29,9 @@ def _run_migrations():
             conn.execute(text("ALTER TABLE trip_baseline ADD COLUMN IF NOT EXISTS dc_name VARCHAR"))
             conn.execute(text("ALTER TABLE stop_baseline ADD COLUMN IF NOT EXISTS reference_order_number VARCHAR"))
             conn.execute(text("ALTER TABLE stop_confirmed ADD COLUMN IF NOT EXISTS reference_order_number VARCHAR"))
+            conn.execute(text("ALTER TABLE stop_baseline ADD COLUMN IF NOT EXISTS address VARCHAR"))
+            conn.execute(text("ALTER TABLE stop_confirmed ADD COLUMN IF NOT EXISTS address VARCHAR"))
+            conn.execute(text("ALTER TABLE dashboard_user ADD COLUMN IF NOT EXISTS totp_secret VARCHAR"))
         else:
             # SQLite has no "IF NOT EXISTS" for ADD COLUMN - check first.
             cols = [row[1] for row in conn.execute(text("PRAGMA table_info(trip_baseline)"))]
@@ -37,9 +40,16 @@ def _run_migrations():
             cols = [row[1] for row in conn.execute(text("PRAGMA table_info(stop_baseline)"))]
             if "reference_order_number" not in cols:
                 conn.execute(text("ALTER TABLE stop_baseline ADD COLUMN reference_order_number VARCHAR"))
+            if "address" not in cols:
+                conn.execute(text("ALTER TABLE stop_baseline ADD COLUMN address VARCHAR"))
             cols = [row[1] for row in conn.execute(text("PRAGMA table_info(stop_confirmed)"))]
             if "reference_order_number" not in cols:
                 conn.execute(text("ALTER TABLE stop_confirmed ADD COLUMN reference_order_number VARCHAR"))
+            if "address" not in cols:
+                conn.execute(text("ALTER TABLE stop_confirmed ADD COLUMN address VARCHAR"))
+            cols = [row[1] for row in conn.execute(text("PRAGMA table_info(dashboard_user)"))]
+            if "totp_secret" not in cols:
+                conn.execute(text("ALTER TABLE dashboard_user ADD COLUMN totp_secret VARCHAR"))
 
 
 def init_db():
