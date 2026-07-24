@@ -173,6 +173,8 @@ def list_trips(
     date_from: str = None,   # "YYYY-MM-DD" - inclusive
     date_to: str = None,     # "YYYY-MM-DD" - inclusive
     dc: str = None,          # exact dc_name match, e.g. "Bhandup"
+    plan_id: str = None,     # partial, case-insensitive match
+    trip_id: str = None,     # partial, case-insensitive match
     db: Session = Depends(get_db),
 ):
     query = db.query(TripBaseline)
@@ -185,6 +187,10 @@ def list_trips(
         query = query.filter(TripBaseline.trip_date <= f"{date_to} 23:59:59")
     if dc:
         query = query.filter(TripBaseline.dc_name == dc)
+    if plan_id:
+        query = query.filter(TripBaseline.plan_id.ilike(f"%{plan_id}%"))
+    if trip_id:
+        query = query.filter(TripBaseline.trip_id.ilike(f"%{trip_id}%"))
 
     baselines = query.all()
     if not baselines:
