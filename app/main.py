@@ -1,5 +1,6 @@
 import io
 import json
+import secrets
 from datetime import datetime, timezone, timedelta
 
 from fastapi import FastAPI, UploadFile, File, Form, Depends, Body, HTTPException
@@ -7,7 +8,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
 
 from .database import init_db, get_db
-from .models import TripBaseline, StopBaseline, TripConfirmed, StopConfirmed, PendingReconfirm
+from .models import TripBaseline, StopBaseline, TripConfirmed, StopConfirmed, PendingReconfirm, DashboardUser
 from .xlsx_parser import parse_dispatch_workbook
 from .diff_engine import compute_diff
 from .auth import verify_api_key, verify_dashboard_key
@@ -433,6 +434,75 @@ def reset_trip(trip_id: str, db: Session = Depends(get_db), _auth: bool = Depend
         db.delete(c)
     db.commit()
     return {"status": "ok", "trip_id": trip_id, "cleared_baseline": bool(b), "cleared_confirmed": bool(c)}
+
+
+# ---------------------------------------------------------------------------
+# DASHBOARD USER MANAGEMENT
+#    Per-person access keys, on top of the single master DASHBOARD_ACCESS_KEY.
+#    All protected by WEBHOOK_API_KEY (the "owner" key) since managing who
+#    can see the dashboard is an admin action, not a dashboard-read action.
+# ---------------------------------------------------------------------------
+@app.post("/admin/dashboard-users")
+def create_dashboard_user(
+    payload: dict = Body(...),
+    db: Session = Depends(get_db),
+    _auth: bool = Depends(verify_api_key),
+):
+    """
+    Creates a new dashboard user with a freshly generated, unique access key.
+    Body: {"name": "alice"}. Returns the key - this is the only time it's
+    shown in full going forward it's just referenced by name.
+    """
+    name = payload.get("name", "").strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="name is required")
+
+    existing = db.get(DashboardUser, name)
+    if existing and not existing.revoked:
+        raise HTTPException(status_code=400, detail=f"User '{name}' already exists and is active")
+
+    new_key = secrets.token_urlsafe(24)
+
+    if existing:
+        # Re-activating a previously revoked name with a brand new key.
+        existing.access_key = new_key
+        existing.revoked = 0
+        existing.created_at = datetime.now(timezone.utc)
+    else:
+        db.add(DashboardUser(name=name, access_key=new_key))
+
+    db.commit()
+    return {"name": name, "access_key": new_key}
+
+
+@app.get("/admin/dashboard-users")
+def list_dashboard_users(db: Session = Depends(get_db), _auth: bool = Depends(verify_api_key)):
+    """Lists every dashboard user and their key/status - for the admin's own reference."""
+    users = db.query(DashboardUser).order_by(DashboardUser.created_at.desc()).all()
+    return [
+        {
+            "name": u.name,
+            "access_key": u.access_key,
+            "created_at": u.created_at.isoformat() if u.created_at else None,
+            "revoked": bool(u.revoked),
+        }
+        for u in users
+    ]
+
+
+@app.delete("/admin/dashboard-users/{name}")
+def revoke_dashboard_user(name: str, db: Session = Depends(get_db), _auth: bool = Depends(verify_api_key)):
+    """
+    Revokes a user's access immediately - their key stops working right away,
+    without affecting anyone else. The row is kept (not deleted) as an audit
+    trail of who used to have access.
+    """
+    user = db.get(DashboardUser, name)
+    if not user:
+        raise HTTPException(status_code=404, detail=f"No dashboard user named '{name}'")
+    user.revoked = 1
+    db.commit()
+    return {"status": "ok", "name": name, "revoked": True}
 
 
 # ---------------------------------------------------------------------------
