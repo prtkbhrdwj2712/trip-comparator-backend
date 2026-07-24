@@ -32,6 +32,8 @@ def _run_migrations():
             conn.execute(text("ALTER TABLE stop_baseline ADD COLUMN IF NOT EXISTS address VARCHAR"))
             conn.execute(text("ALTER TABLE stop_confirmed ADD COLUMN IF NOT EXISTS address VARCHAR"))
             conn.execute(text("ALTER TABLE dashboard_user ADD COLUMN IF NOT EXISTS totp_secret VARCHAR"))
+            conn.execute(text("ALTER TABLE dashboard_user ADD COLUMN IF NOT EXISTS failed_login_attempts INTEGER DEFAULT 0"))
+            conn.execute(text("ALTER TABLE dashboard_user ADD COLUMN IF NOT EXISTS locked_until TIMESTAMP"))
         else:
             # SQLite has no "IF NOT EXISTS" for ADD COLUMN - check first.
             cols = [row[1] for row in conn.execute(text("PRAGMA table_info(trip_baseline)"))]
@@ -50,6 +52,38 @@ def _run_migrations():
             cols = [row[1] for row in conn.execute(text("PRAGMA table_info(dashboard_user)"))]
             if "totp_secret" not in cols:
                 conn.execute(text("ALTER TABLE dashboard_user ADD COLUMN totp_secret VARCHAR"))
+            if "failed_login_attempts" not in cols:
+                conn.execute(text("ALTER TABLE dashboard_user ADD COLUMN failed_login_attempts INTEGER DEFAULT 0"))
+            if "locked_until" not in cols:
+                conn.execute(text("ALTER TABLE dashboard_user ADD COLUMN locked_until TIMESTAMP"))
+
+    _migrate_plaintext_keys_to_hashed()
+
+
+def _migrate_plaintext_keys_to_hashed():
+    """
+    One-time, idempotent data migration: any DashboardUser row still holding
+    a plaintext access_key (from before hashing was introduced) gets it
+    replaced with a bcrypt hash of that SAME value - so existing users'
+    passwords keep working exactly as before, just stored safely from now on.
+    Safe to run on every startup: already-hashed rows are left untouched.
+    """
+    from .models import DashboardUser
+    from .password_utils import hash_key, is_hashed
+
+    db = SessionLocal()
+    try:
+        users = db.query(DashboardUser).all()
+        migrated = 0
+        for u in users:
+            if u.access_key and not is_hashed(u.access_key):
+                u.access_key = hash_key(u.access_key)
+                migrated += 1
+        if migrated:
+            db.commit()
+            print(f"[migration] Hashed {migrated} legacy plaintext dashboard user key(s).")
+    finally:
+        db.close()
 
 
 def init_db():
