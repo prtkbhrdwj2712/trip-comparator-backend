@@ -374,8 +374,11 @@ def get_trip(trip_id: str, db: Session = Depends(get_db)):
             "vehicle_id": b.vehicle_id,
             "driver_name": b.driver_name,
             "weight_utilization": b.weight_utilization,
+            "space_utilization": b.space_utilization,
             "trip_weight_kg": b.trip_weight_kg,
             "trip_cost": b.trip_cost,
+            "distance_km": b.planned_trip_distance_km,
+            "duration_h": b.planned_trip_duration_h,
             "no_of_stops": b.no_of_stops,
             "received_at": b.received_at.isoformat() if b.received_at else None,
             "stops": [
@@ -390,8 +393,11 @@ def get_trip(trip_id: str, db: Session = Depends(get_db)):
             "vehicle_id": confirmed.vehicle_id,
             "driver_name": confirmed.driver_name,
             "weight_utilization": confirmed.weight_utilization,
+            "space_utilization": confirmed.space_utilization,
             "trip_weight_kg": confirmed.trip_weight_kg,
             "trip_cost": confirmed.trip_cost,
+            "distance_km": confirmed.actual_trip_distance_km,
+            "duration_h": confirmed.actual_trip_duration_h,
             "no_of_stops": confirmed.no_of_stops,
             "confirmed_at": confirmed.confirmed_at.isoformat() if confirmed.confirmed_at else None,
             "stops": [
