@@ -39,11 +39,20 @@ def verify_api_key(x_api_key: str = Header(None)):
 def verify_dashboard_key(x_dashboard_key: str = Header(None), db: Session = Depends(get_db)):
     if x_dashboard_key == DASHBOARD_KEY:
         return True
+    if not x_dashboard_key:
+        raise HTTPException(status_code=401, detail="Invalid or missing X-Dashboard-Key header")
+
     from .models import DashboardUser
-    user = db.query(DashboardUser).filter(
-        DashboardUser.access_key == x_dashboard_key,
-        DashboardUser.revoked == 0,
-    ).first()
-    if user:
-        return True
+    from . import password_utils
+
+    # Access keys are stored hashed (bcrypt, salted) - the same plaintext
+    # produces a different hash each time, so we can't query for a direct
+    # match. Instead, check the submitted key against each active user's
+    # stored hash. Fine at the scale of a handful of named users; would
+    # need a different approach (e.g. a fast lookup-then-verify by a
+    # separate non-secret identifier) if this ever grew to many users.
+    for user in db.query(DashboardUser).filter(DashboardUser.revoked == 0).all():
+        if password_utils.verify_key(x_dashboard_key, user.access_key):
+            return True
+
     raise HTTPException(status_code=401, detail="Invalid or missing X-Dashboard-Key header")
