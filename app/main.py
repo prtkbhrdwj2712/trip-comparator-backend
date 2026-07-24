@@ -169,10 +169,54 @@ async def receive_trip_confirmed(
 @app.get("/api/trips")
 def list_trips(db: Session = Depends(get_db)):
     baselines = db.query(TripBaseline).all()
+    if not baselines:
+        return []
+
+    baseline_trip_ids = [b.trip_id for b in baselines]
+
+    # Bulk-fetch confirmed rows for all these trips in ONE query instead of
+    # one db.get() per trip (was the main N+1 offender).
+    confirmed_rows = db.query(TripConfirmed).filter(TripConfirmed.trip_id.in_(baseline_trip_ids)).all()
+    confirmed_by_id = {c.trip_id: c for c in confirmed_rows}
+    confirmed_trip_ids = list(confirmed_by_id.keys())
+
+    # Bulk-fetch only the columns needed for the dealer diff (not full stop
+    # rows), and only for trips that actually have a confirmed counterpart -
+    # this is what was blowing up memory, since accessing .stops on every
+    # trip lazy-loads every stop row for every trip on every request.
+    baseline_stops_by_trip = {}
+    if confirmed_trip_ids:
+        rows = (
+            db.query(StopBaseline.trip_id, StopBaseline.activity, StopBaseline.ship_to_code, StopBaseline.ship_to_name)
+            .filter(StopBaseline.trip_id.in_(confirmed_trip_ids))
+            .all()
+        )
+        for trip_id, activity, code, name in rows:
+            baseline_stops_by_trip.setdefault(trip_id, []).append(
+                {"activity": activity, "ship_to_code": code, "ship_to_name": name}
+            )
+
+        confirmed_stops_by_trip = {}
+        rows = (
+            db.query(StopConfirmed.trip_id, StopConfirmed.activity, StopConfirmed.ship_to_code, StopConfirmed.ship_to_name)
+            .filter(StopConfirmed.trip_id.in_(confirmed_trip_ids))
+            .all()
+        )
+        for trip_id, activity, code, name in rows:
+            confirmed_stops_by_trip.setdefault(trip_id, []).append(
+                {"activity": activity, "ship_to_code": code, "ship_to_name": name}
+            )
+    else:
+        confirmed_stops_by_trip = {}
+
     out = []
     for b in baselines:
-        confirmed = db.get(TripConfirmed, b.trip_id)
-        diff = compute_diff(b, confirmed)
+        confirmed = confirmed_by_id.get(b.trip_id)
+        diff = compute_diff(
+            b, confirmed,
+            baseline_stops=baseline_stops_by_trip.get(b.trip_id, []) if confirmed else None,
+            confirmed_stops=confirmed_stops_by_trip.get(b.trip_id, []) if confirmed else None,
+        )
         out.append({
             "trip_id": b.trip_id,
             "plan_id": b.plan_id,
@@ -191,25 +235,31 @@ def get_trip(trip_id: str, db: Session = Depends(get_db)):
     diff = compute_diff(b, confirmed)
     return {
         "trip_id": trip_id,
+        "plan_id": b.plan_id,
+        "trip_name": b.trip_name,
         "baseline": {
             "vehicle_category": b.vehicle_category,
             "vehicle_id": b.vehicle_id,
+            "driver_name": b.driver_name,
             "weight_utilization": b.weight_utilization,
             "trip_weight_kg": b.trip_weight_kg,
             "no_of_stops": b.no_of_stops,
             "stops": [
-                {"code": s.ship_to_code, "name": s.ship_to_name, "sequence": s.sequence}
+                {"code": s.ship_to_code, "name": s.ship_to_name, "sequence": s.sequence,
+                 "arrival": s.planned_arrival}
                 for s in b.stops if s.activity == "Drop"
             ],
         },
         "confirmed": None if not confirmed else {
             "vehicle_category": confirmed.vehicle_category,
             "vehicle_id": confirmed.vehicle_id,
+            "driver_name": confirmed.driver_name,
             "weight_utilization": confirmed.weight_utilization,
             "trip_weight_kg": confirmed.trip_weight_kg,
             "no_of_stops": confirmed.no_of_stops,
             "stops": [
-                {"code": s.ship_to_code, "name": s.ship_to_name, "sequence": s.sequence}
+                {"code": s.ship_to_code, "name": s.ship_to_name, "sequence": s.sequence,
+                 "arrival": s.actual_arrival}
                 for s in confirmed.stops if s.activity == "Drop"
             ],
         },
