@@ -5,13 +5,19 @@ read from ORM rows instead of the two Excel files.
 """
 
 TRIP_LEVEL_FIELDS = [
-    ("vehicle_category", "Vehicle Category"),
-    ("vehicle_id", "Vehicle Number"),
-    ("driver_name", "Driver"),
-    ("trip_weight_kg", "Total Weight (kg)"),
-    ("weight_utilization", "Weight Utilization %"),
-    ("no_of_stops", "Number of Dealers"),
-    ("trip_cost", "Trip Cost"),
+    # (baseline_field, confirmed_field, label) - baseline_field == confirmed_field
+    # for most, but distance/duration are named differently on each side
+    # (planned_ vs actual_).
+    ("vehicle_category", "vehicle_category", "Vehicle Category"),
+    ("vehicle_id", "vehicle_id", "Vehicle Number"),
+    ("driver_name", "driver_name", "Driver"),
+    ("trip_weight_kg", "trip_weight_kg", "Total Weight (kg)"),
+    ("weight_utilization", "weight_utilization", "Weight Utilization %"),
+    ("space_utilization", "space_utilization", "Space Utilization %"),
+    ("no_of_stops", "no_of_stops", "Number of Dealers"),
+    ("trip_cost", "trip_cost", "Trip Cost"),
+    ("planned_trip_distance_km", "actual_trip_distance_km", "Distance (km)"),
+    ("planned_trip_duration_h", "actual_trip_duration_h", "Duration (h)"),
 ]
 
 
@@ -48,11 +54,20 @@ def compute_diff(baseline_trip, confirmed_trip, baseline_stops=None, confirmed_s
         return "" if v is None else str(v)
 
     trip_diffs = []
-    for field, label in TRIP_LEVEL_FIELDS:
-        bv = getattr(baseline_trip, field, None)
-        av = getattr(confirmed_trip, field, None)
+    for baseline_field, confirmed_field, label in TRIP_LEVEL_FIELDS:
+        bv = getattr(baseline_trip, baseline_field, None)
+        av = getattr(confirmed_trip, confirmed_field, None)
         if _norm(bv) != _norm(av):
-            trip_diffs.append({"field": field, "label": label, "planned": bv, "confirmed": av})
+            # Use a normalized field key (not the raw attribute name, which
+            # can differ between baseline/confirmed) so callers can match on
+            # one consistent identifier regardless of which side it came from.
+            if "distance" in baseline_field:
+                normalized_key = "distance_km"
+            elif "duration" in baseline_field:
+                normalized_key = "duration_h"
+            else:
+                normalized_key = baseline_field
+            trip_diffs.append({"field": normalized_key, "label": label, "planned": bv, "confirmed": av})
 
     b_stops = baseline_stops if baseline_stops is not None else [
         {"activity": s.activity, "ship_to_code": s.ship_to_code, "ship_to_name": s.ship_to_name}
