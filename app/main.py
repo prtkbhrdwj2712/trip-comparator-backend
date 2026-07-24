@@ -10,7 +10,7 @@ from .database import init_db, get_db
 from .models import TripBaseline, StopBaseline, TripConfirmed, StopConfirmed, PendingReconfirm
 from .xlsx_parser import parse_dispatch_workbook
 from .diff_engine import compute_diff
-from .auth import verify_api_key
+from .auth import verify_api_key, verify_dashboard_key
 
 app = FastAPI(title="Trip Comparator Backend")
 
@@ -178,6 +178,7 @@ def list_trips(
     plan_id: str = None,     # partial, case-insensitive match
     trip_id: str = None,     # partial, case-insensitive match
     db: Session = Depends(get_db),
+    _auth: bool = Depends(verify_dashboard_key),
 ):
     query = db.query(TripBaseline)
     if date_from:
@@ -255,14 +256,14 @@ def list_trips(
 
 
 @app.get("/api/dcs")
-def list_dcs(db: Session = Depends(get_db)):
+def list_dcs(db: Session = Depends(get_db), _auth: bool = Depends(verify_dashboard_key)):
     """Distinct DC names seen so far, for populating the dashboard's filter dropdown."""
     rows = db.query(TripBaseline.dc_name).filter(TripBaseline.dc_name.isnot(None)).distinct().all()
     return sorted([r[0] for r in rows if r[0]])
 
 
 @app.get("/api/stats")
-def get_stats(db: Session = Depends(get_db)):
+def get_stats(db: Session = Depends(get_db), _auth: bool = Depends(verify_dashboard_key)):
     """
     Diagnostic breakdown: how many distinct plans and trips landed per DC
     per date. Meant for sanity-checking whether a trip/plan count "looks
@@ -358,7 +359,7 @@ def pending_reconfirm_status(plan_id: str, db: Session = Depends(get_db), _auth:
 
 
 @app.get("/api/trips/{trip_id}")
-def get_trip(trip_id: str, db: Session = Depends(get_db)):
+def get_trip(trip_id: str, db: Session = Depends(get_db), _auth: bool = Depends(verify_dashboard_key)):
     b = db.get(TripBaseline, trip_id)
     if not b:
         raise HTTPException(status_code=404, detail="Trip not found in baseline")
