@@ -253,6 +253,40 @@ def list_dcs(db: Session = Depends(get_db)):
     return sorted([r[0] for r in rows if r[0]])
 
 
+@app.get("/api/stats")
+def get_stats(db: Session = Depends(get_db)):
+    """
+    Diagnostic breakdown: how many distinct plans and trips landed per DC
+    per date. Meant for sanity-checking whether a trip/plan count "looks
+    right" - a normal, gradual accumulation should show a fairly even
+    spread across dates; a sudden spike on one date/DC combo is worth
+    investigating as a possible duplicate-ingestion or retry-storm issue.
+    """
+    from sqlalchemy import func
+    rows = (
+        db.query(
+            TripBaseline.dc_name,
+            TripBaseline.trip_date,
+            func.count(func.distinct(TripBaseline.plan_id)).label("plan_count"),
+            func.count(TripBaseline.trip_id).label("trip_count"),
+        )
+        .group_by(TripBaseline.dc_name, TripBaseline.trip_date)
+        .order_by(TripBaseline.trip_date.desc())
+        .all()
+    )
+    breakdown = [
+        {"dc_name": r.dc_name, "trip_date": r.trip_date, "plan_count": r.plan_count, "trip_count": r.trip_count}
+        for r in rows
+    ]
+    total_plans = db.query(func.count(func.distinct(TripBaseline.plan_id))).scalar()
+    total_trips = db.query(func.count(TripBaseline.trip_id)).scalar()
+    return {
+        "total_plans": total_plans,
+        "total_trips": total_trips,
+        "breakdown_by_dc_and_date": breakdown,
+    }
+
+
 @app.get("/api/trips/{trip_id}")
 def get_trip(trip_id: str, db: Session = Depends(get_db)):
     b = db.get(TripBaseline, trip_id)
