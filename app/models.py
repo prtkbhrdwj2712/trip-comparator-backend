@@ -183,3 +183,21 @@ class VehicleTransporter(Base):
     transporter_name = Column(String, nullable=False)
     updated_at = Column(DateTime, default=utcnow)
 
+
+class DealerLocation(Base):
+    """
+    Authoritative dealer_code -> lat/lng, supplied directly rather than
+    guessed via free-text geocoding. Checked FIRST by the map endpoint;
+    free Nominatim geocoding (GeocodeCache) is only a fallback for any
+    dealer codes not present here. Keyed by dealer code (matches
+    ship_to_code on StopBaseline/StopConfirmed exactly) rather than
+    address text, which is a much more reliable join.
+    """
+    __tablename__ = "dealer_location"
+
+    dealer_code = Column(String, primary_key=True)
+    latitude = Column(Float, nullable=False)
+    longitude = Column(Float, nullable=False)
+    dealer_name = Column(String, nullable=True)
+    updated_at = Column(DateTime, default=utcnow)
+
