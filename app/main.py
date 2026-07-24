@@ -376,6 +376,7 @@ def get_trip(trip_id: str, db: Session = Depends(get_db)):
             "trip_weight_kg": b.trip_weight_kg,
             "trip_cost": b.trip_cost,
             "no_of_stops": b.no_of_stops,
+            "received_at": b.received_at.isoformat() if b.received_at else None,
             "stops": [
                 {"code": s.ship_to_code, "name": s.ship_to_name, "sequence": s.sequence,
                  "arrival": s.planned_arrival, "reference_order_number": s.reference_order_number,
@@ -391,6 +392,7 @@ def get_trip(trip_id: str, db: Session = Depends(get_db)):
             "trip_weight_kg": confirmed.trip_weight_kg,
             "trip_cost": confirmed.trip_cost,
             "no_of_stops": confirmed.no_of_stops,
+            "confirmed_at": confirmed.confirmed_at.isoformat() if confirmed.confirmed_at else None,
             "stops": [
                 {"code": s.ship_to_code, "name": s.ship_to_name, "sequence": s.sequence,
                  "arrival": s.actual_arrival, "reference_order_number": s.reference_order_number,
