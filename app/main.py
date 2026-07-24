@@ -13,6 +13,7 @@ from .xlsx_parser import parse_dispatch_workbook
 from .diff_engine import compute_diff
 from .auth import verify_api_key, verify_dashboard_key
 from . import totp_utils
+from . import password_utils
 from . import geocode as geocode_module
 
 app = FastAPI(title="Trip Comparator Backend")
@@ -689,14 +690,17 @@ def create_dashboard_user(
 
     custom_key = (payload.get("access_key") or "").strip()
     new_key = custom_key if custom_key else secrets.token_urlsafe(24)
+    hashed = password_utils.hash_key(new_key)
 
     if existing:
         # Re-activating a previously revoked name with a (possibly custom) new key.
-        existing.access_key = new_key
+        existing.access_key = hashed
         existing.revoked = 0
         existing.created_at = datetime.now(timezone.utc)
+        existing.failed_login_attempts = 0
+        existing.locked_until = None
     else:
-        db.add(DashboardUser(name=name, access_key=new_key))
+        db.add(DashboardUser(name=name, access_key=hashed))
 
     db.commit()
     return {"name": name, "access_key": new_key}
@@ -721,21 +725,31 @@ def set_dashboard_user_key(
 
     custom_key = (payload.get("access_key") or "").strip()
     new_key = custom_key if custom_key else secrets.token_urlsafe(24)
-    user.access_key = new_key
+    user.access_key = password_utils.hash_key(new_key)
+    user.failed_login_attempts = 0
+    user.locked_until = None
     db.commit()
     return {"name": name, "access_key": new_key}
 
 
 @app.get("/admin/dashboard-users")
 def list_dashboard_users(db: Session = Depends(get_db), _auth: bool = Depends(verify_api_key)):
-    """Lists every dashboard user and their key/status - for the admin's own reference."""
+    """
+    Lists every dashboard user and their status. Does NOT return the access
+    key itself anymore (now stored hashed - a hash isn't useful to show
+    anyway, and there's no way to recover the plaintext). Use
+    /admin/dashboard-users/{name}/set-key if you need to issue a new one.
+    """
     users = db.query(DashboardUser).order_by(DashboardUser.created_at.desc()).all()
+    now = datetime.now(timezone.utc)
     return [
         {
             "name": u.name,
-            "access_key": u.access_key,
             "created_at": u.created_at.isoformat() if u.created_at else None,
             "revoked": bool(u.revoked),
+            "totp_enabled": bool(u.totp_secret),
+            "currently_locked_out": bool(u.locked_until and _as_utc(u.locked_until) > now),
+            "locked_until": u.locked_until.isoformat() if u.locked_until else None,
         }
         for u in users
     ]
@@ -790,6 +804,10 @@ def disable_2fa(name: str, db: Session = Depends(get_db), _auth: bool = Depends(
     return {"status": "ok", "name": name, "totp_disabled": True}
 
 
+MAX_FAILED_LOGIN_ATTEMPTS = 3
+LOCKOUT_MINUTES = 15
+
+
 @app.post("/api/login")
 def dashboard_login(payload: dict = Body(...), db: Session = Depends(get_db)):
     """
@@ -797,6 +815,11 @@ def dashboard_login(payload: dict = Body(...), db: Session = Depends(get_db)):
     together (not just that the key is valid for SOME user), and enforces
     a TOTP code if that user has 2FA enabled. The master DASHBOARD_ACCESS_KEY
     still works as a no-username-needed fallback, same as before.
+
+    Access keys are stored hashed (bcrypt) and verified via password_utils,
+    never compared as plaintext. After too many wrong attempts in a row for
+    a given username, that account is temporarily locked out regardless of
+    whether the next attempt would've been correct - slows down guessing.
 
     This endpoint itself isn't protected by verify_dashboard_key (that would
     be circular) - it's the thing that decides whether the key the user is
@@ -815,8 +838,29 @@ def dashboard_login(payload: dict = Body(...), db: Session = Depends(get_db)):
         raise HTTPException(status_code=400, detail="Username is required")
 
     user = db.get(DashboardUser, name)
-    if not user or user.revoked or user.access_key != access_key:
+    if not user or user.revoked:
         raise HTTPException(status_code=401, detail="Incorrect username or access key")
+
+    now = datetime.now(timezone.utc)
+    if user.locked_until and _as_utc(user.locked_until) > now:
+        minutes_left = int((_as_utc(user.locked_until) - now).total_seconds() / 60) + 1
+        raise HTTPException(
+            status_code=401,
+            detail=f"Too many failed attempts. Try again in {minutes_left} minute(s).",
+        )
+
+    if not password_utils.verify_key(access_key, user.access_key):
+        user.failed_login_attempts = (user.failed_login_attempts or 0) + 1
+        if user.failed_login_attempts >= MAX_FAILED_LOGIN_ATTEMPTS:
+            user.locked_until = now + timedelta(minutes=LOCKOUT_MINUTES)
+            user.failed_login_attempts = 0
+        db.commit()
+        raise HTTPException(status_code=401, detail="Incorrect username or access key")
+
+    # Correct password - reset any lockout tracking.
+    user.failed_login_attempts = 0
+    user.locked_until = None
+    db.commit()
 
     if user.totp_secret:
         if not totp_code:
