@@ -95,6 +95,7 @@ def parse_dispatch_workbook(file_like):
                 "sequence": _stringify(row[idx["sequence"]]) if "sequence" in idx else None,
                 "arrival": _stringify(row[idx["planned arrival"]]) if "planned arrival" in idx else None,
                 "reference_order_number": _stringify(row[idx["reference order number"]]) if "reference order number" in idx else None,
+                "address": _stringify(row[idx["address"]]) if "address" in idx else None,
                 "weight_kg": 0.0,
             }
         # weight(kg) is a per-SKU-line value - a stop has one row per SKU
