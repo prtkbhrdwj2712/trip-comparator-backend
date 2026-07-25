@@ -27,6 +27,7 @@ def _run_migrations():
     with engine.begin() as conn:
         if is_postgres:
             conn.execute(text("ALTER TABLE trip_baseline ADD COLUMN IF NOT EXISTS dc_name VARCHAR"))
+            conn.execute(text("ALTER TABLE trip_baseline ADD COLUMN IF NOT EXISTS baseline_unavailable INTEGER DEFAULT 0"))
             conn.execute(text("ALTER TABLE stop_baseline ADD COLUMN IF NOT EXISTS reference_order_number VARCHAR"))
             conn.execute(text("ALTER TABLE stop_confirmed ADD COLUMN IF NOT EXISTS reference_order_number VARCHAR"))
             conn.execute(text("ALTER TABLE stop_baseline ADD COLUMN IF NOT EXISTS address VARCHAR"))
@@ -39,6 +40,8 @@ def _run_migrations():
             cols = [row[1] for row in conn.execute(text("PRAGMA table_info(trip_baseline)"))]
             if "dc_name" not in cols:
                 conn.execute(text("ALTER TABLE trip_baseline ADD COLUMN dc_name VARCHAR"))
+            if "baseline_unavailable" not in cols:
+                conn.execute(text("ALTER TABLE trip_baseline ADD COLUMN baseline_unavailable INTEGER DEFAULT 0"))
             cols = [row[1] for row in conn.execute(text("PRAGMA table_info(stop_baseline)"))]
             if "reference_order_number" not in cols:
                 conn.execute(text("ALTER TABLE stop_baseline ADD COLUMN reference_order_number VARCHAR"))
