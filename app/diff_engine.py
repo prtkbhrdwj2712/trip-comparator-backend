@@ -57,6 +57,64 @@ def _is_legitimate_confirmation(confirmed_trip):
     return True
 
 
+def _compute_cpt(cost, weight_kg):
+    """Cost per ton = cost / (weight_kg / 1000). None if not computable (missing cost, or zero/missing weight)."""
+    if cost is None or not weight_kg:
+        return None
+    return cost / (weight_kg / 1000)
+
+
+def _cpt_change_explanation(baseline_cost, baseline_weight, confirmed_cost, confirmed_weight):
+    """
+    Cost per ton can shift for two independent reasons - the cost changed,
+    the weight changed, or both - and a CPT number alone doesn't say which.
+    This builds a plain-language note naming whichever factor(s) actually
+    moved, so the reason is always visible rather than something you have
+    to work out by cross-referencing the cost and weight fields yourself.
+    """
+    cost_changed = baseline_cost is not None and confirmed_cost is not None and baseline_cost != confirmed_cost
+    weight_changed = bool(baseline_weight) and bool(confirmed_weight) and baseline_weight != confirmed_weight
+
+    if not cost_changed and not weight_changed:
+        return None
+
+    parts = []
+    if weight_changed:
+        parts.append(f"weight {baseline_weight:g}kg → {confirmed_weight:g}kg")
+    if cost_changed:
+        parts.append(f"cost ₹{baseline_cost:g} → ₹{confirmed_cost:g}")
+
+    if cost_changed and weight_changed:
+        driver = "both cost and weight changing"
+    elif weight_changed:
+        driver = "weight changing (cost unchanged)"
+    else:
+        driver = "cost changing (weight unchanged)"
+
+    return f"Driven by {driver}: {', '.join(parts)}"
+
+
+def _count_orders(stops):
+    """
+    Counts real orders across Drop stops - reference_order_number can hold
+    several orders bundled into one comma-joined string for a single dealer
+    stop (e.g. "0448668629_2,0448919058"), so this is NOT the same as the
+    number of dealers/stops. Returns 0 gracefully if the field isn't present
+    (e.g. bulk-list calls that only pre-fetch a few lightweight columns for
+    performance) rather than erroring - order count is really only reliable
+    in the single-trip detail view anyway.
+    """
+    total = 0
+    for s in stops:
+        activity = s["activity"] if isinstance(s, dict) else s.activity
+        if activity != "Drop":
+            continue
+        ref = s.get("reference_order_number") if isinstance(s, dict) else getattr(s, "reference_order_number", None)
+        if ref:
+            total += len([x for x in ref.split(",") if x.strip()])
+    return total
+
+
 def compute_diff(baseline_trip, confirmed_trip, baseline_stops=None, confirmed_stops=None):
     """
     baseline_trip: TripBaseline ORM instance
@@ -114,11 +172,13 @@ def compute_diff(baseline_trip, confirmed_trip, baseline_stops=None, confirmed_s
             trip_diffs.append({"field": normalized_key, "label": label, "planned": bv, "confirmed": av})
 
     b_stops = baseline_stops if baseline_stops is not None else [
-        {"activity": s.activity, "ship_to_code": s.ship_to_code, "ship_to_name": s.ship_to_name}
+        {"activity": s.activity, "ship_to_code": s.ship_to_code, "ship_to_name": s.ship_to_name,
+         "reference_order_number": s.reference_order_number}
         for s in baseline_trip.stops
     ]
     a_stops = confirmed_stops if confirmed_stops is not None else [
-        {"activity": s.activity, "ship_to_code": s.ship_to_code, "ship_to_name": s.ship_to_name}
+        {"activity": s.activity, "ship_to_code": s.ship_to_code, "ship_to_name": s.ship_to_name,
+         "reference_order_number": s.reference_order_number}
         for s in confirmed_trip.stops
     ]
 
@@ -134,7 +194,25 @@ def compute_diff(baseline_trip, confirmed_trip, baseline_stops=None, confirmed_s
     removed_list = [{"code": b_by_key[k]["ship_to_code"], "name": b_by_key[k]["ship_to_name"]} for k in removed]
     added_list = [{"code": a_by_key[k]["ship_to_code"], "name": a_by_key[k]["ship_to_name"]} for k in added]
 
+    baseline_order_count = _count_orders(b_stops)
+    confirmed_order_count = _count_orders(a_stops)
+
     has_changes = bool(trip_diffs) or bool(removed) or bool(added)
+
+    baseline_cpt = _compute_cpt(baseline_trip.trip_cost, baseline_trip.trip_weight_kg)
+    confirmed_cpt = _compute_cpt(confirmed_trip.trip_cost, confirmed_trip.trip_weight_kg)
+    if baseline_cpt is not None and confirmed_cpt is not None and round(baseline_cpt, 2) != round(confirmed_cpt, 2):
+        trip_diffs.append({
+            "field": "cost_per_ton",
+            "label": "Cost per Ton",
+            "planned": round(baseline_cpt, 2),
+            "confirmed": round(confirmed_cpt, 2),
+            "explanation": _cpt_change_explanation(
+                baseline_trip.trip_cost, baseline_trip.trip_weight_kg,
+                confirmed_trip.trip_cost, confirmed_trip.trip_weight_kg,
+            ),
+        })
+        has_changes = True
 
     return {
         "status": "confirmed_with_changes" if has_changes else "confirmed_no_changes",
@@ -145,4 +223,8 @@ def compute_diff(baseline_trip, confirmed_trip, baseline_stops=None, confirmed_s
         "dealers_added": added_list,         # req #10
         "baseline_total_weight_kg": baseline_trip.trip_weight_kg,
         "confirmed_total_weight_kg": confirmed_trip.trip_weight_kg,
+        "baseline_cost_per_ton": round(baseline_cpt, 2) if baseline_cpt is not None else None,
+        "confirmed_cost_per_ton": round(confirmed_cpt, 2) if confirmed_cpt is not None else None,
+        "baseline_order_count": baseline_order_count,
+        "confirmed_order_count": confirmed_order_count,
     }
