@@ -3,6 +3,14 @@ Computes the planned-vs-confirmed diff for a single trip.
 This is the same logic used to build the first dashboard demo, adapted to
 read from ORM rows instead of the two Excel files.
 """
+from datetime import datetime, timezone, timedelta
+
+# If a trip has no confirmed record at all after this long, we no longer
+# treat it as merely "awaiting" - matches GIVE_UP_AFTER_HOURS in main.py,
+# where the polling system itself stops checking. Once polling has given
+# up with zero confirmation ever appearing, the trip is presumed cancelled
+# rather than left in permanent limbo.
+UNCONFIRMED_CANCELLATION_HOURS = 24
 
 TRIP_LEVEL_FIELDS = [
     # (baseline_field, confirmed_field, label) - baseline_field == confirmed_field
@@ -62,6 +70,13 @@ def compute_diff(baseline_trip, confirmed_trip, baseline_stops=None, confirmed_s
         single-trip lookups like /api/trips/{trip_id}).
     """
     if confirmed_trip is None:
+        received_at = baseline_trip.received_at
+        if received_at is not None:
+            if received_at.tzinfo is None:
+                received_at = received_at.replace(tzinfo=timezone.utc)
+            age = datetime.now(timezone.utc) - received_at
+            if age > timedelta(hours=UNCONFIRMED_CANCELLATION_HOURS):
+                return {"status": "cancelled"}
         return {"status": "awaiting_confirmation"}
 
     if not _is_legitimate_confirmation(confirmed_trip):
