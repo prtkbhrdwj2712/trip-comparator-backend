@@ -256,6 +256,7 @@ def list_trips(
             "trip_name": b.trip_name,
             "trip_date": b.trip_date,
             "dc_name": b.dc_name,
+            "baseline_unavailable": bool(b.baseline_unavailable),
             **diff,
         })
     return out
@@ -391,6 +392,7 @@ def get_trip(trip_id: str, db: Session = Depends(get_db), _auth: bool = Depends(
         "plan_id": b.plan_id,
         "trip_name": b.trip_name,
         "dc_name": b.dc_name,
+        "baseline_unavailable": bool(b.baseline_unavailable),
         "baseline": {
             "vehicle_category": b.vehicle_category,
             "vehicle_id": b.vehicle_id,
@@ -1085,12 +1087,64 @@ async def receive_plan_reconfirm(
         row.trip_id for row in db.query(TripBaseline).filter(TripBaseline.plan_id == plan_id).all()
     }
 
+    # DC name for this plan (all trips in a plan share the same DC) - reused
+    # below for any newly-discovered trip, so it's tagged consistently with
+    # its siblings rather than left null.
+    sibling_dc_row = db.query(TripBaseline.dc_name).filter(TripBaseline.plan_id == plan_id).first()
+    plan_dc_name = sibling_dc_row[0] if sibling_dc_row else None
+
     newly_confirmed = []
+    newly_discovered = []
 
     for trip_id, t in trips.items():
         if trip_id not in baseline_trip_ids:
-            # A trip we've never seen baselined for this plan - ignore rather
-            # than guess; shouldn't normally happen.
+            # A trip added to this plan AFTER our original baseline capture
+            # (e.g. a re-optimization on Mojro's side) - we never had a
+            # chance to record its original planned state, so the first
+            # time we see it becomes its baseline instead. This is honestly
+            # a "first known state", not a true pre-optimization snapshot,
+            # but it's the best we can do without ever having seen it before.
+            # It is NOT marked confirmed yet - same rule as everything else,
+            # it only becomes confirmed if it later disappears from a
+            # subsequent re-download.
+            row = TripBaseline(
+                trip_id=trip_id,
+                plan_id=t.get("plan_id"),
+                trip_name=t.get("trip_name"),
+                trip_date=t.get("trip_date"),
+                dc_name=plan_dc_name,
+                baseline_unavailable=1,
+                vehicle_category=t.get("vehicle_category"),
+                vehicle_id=t.get("vehicle_id"),
+                driver_name=t.get("driver_name"),
+                planned_trip_distance_km=_to_float(t.get("trip_distance_km")),
+                planned_trip_duration_h=_to_float(t.get("trip_duration_h")),
+                trip_weight_kg=_to_float(t.get("trip_weight_kg")),
+                trip_volume_cm3=_to_float(t.get("trip_volume_cm3")),
+                weight_utilization=_to_float(t.get("weight_utilization")),
+                space_utilization=_to_float(t.get("space_utilization")),
+                distance_utilization=_to_float(t.get("distance_utilization")),
+                time_utilization=_to_float(t.get("time_utilization")),
+                trip_cost=_to_float(t.get("trip_cost")),
+                no_of_stops=t.get("no_of_stops"),
+                raw=t,
+            )
+            db.add(row)
+            db.flush()
+            for s in t["stops"]:
+                db.add(StopBaseline(
+                    trip_id=trip_id,
+                    activity=s.get("activity"),
+                    ship_to_code=s.get("ship_to_code"),
+                    ship_to_name=s.get("ship_to_name"),
+                    sequence=_to_float(s.get("sequence")),
+                    planned_arrival=s.get("arrival"),
+                    reference_order_number=s.get("reference_order_number"),
+                    address=s.get("address"),
+                    weight_kg=_to_float(s.get("weight_kg")),
+                ))
+            baseline_trip_ids.add(trip_id)
+            newly_discovered.append(trip_id)
             continue
 
         existing = db.get(TripConfirmed, trip_id)
@@ -1153,6 +1207,7 @@ async def receive_plan_reconfirm(
         "plan_id": plan_id,
         "newly_confirmed": newly_confirmed,
         "still_planned": still_planned,
+        "newly_discovered": newly_discovered,
     }
 
 
