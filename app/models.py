@@ -31,6 +31,8 @@ class TripBaseline(Base):
     trip_name = Column(String)
     trip_date = Column(String)
     dc_name = Column(String, nullable=True, index=True)  # e.g. "Bhandup" - passed by the uploader, not the xlsx itself
+    plan_created_at = Column(DateTime, nullable=True)  # Mojro's real plan-creation timestamp (data.createdAt from
+        # the webhook), not our own ingestion time - used as the basis for the 13-hour cancellation cutoff
     baseline_unavailable = Column(Integer, default=0)  # 0/1 - this trip was added to the plan AFTER our
         # original baseline capture (e.g. someone manually added it on Mojro's side); what we stored as
         # its "baseline" is really just its first-known state during a later re-check, not a true
