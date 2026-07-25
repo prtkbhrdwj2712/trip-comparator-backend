@@ -202,3 +202,20 @@ class DealerLocation(Base):
     longitude = Column(Float, nullable=False)
     dealer_name = Column(String, nullable=True)
     updated_at = Column(DateTime, default=utcnow)
+
+
+class DeviceToken(Base):
+    """
+    "Remember this device" for 2FA - once a user enters their code
+    successfully, their browser gets one of these (stored client-side) so
+    they're not asked for a fresh code on every single login for 12 hours.
+    A user can have several (one per browser/device); each is independent
+    and expires exactly 12 hours after it was issued (not a rolling
+    window - it genuinely resets after 12h, requiring the code again).
+    """
+    __tablename__ = "device_token"
+
+    token = Column(String, primary_key=True)
+    username = Column(String, index=True, nullable=False)
+    expires_at = Column(DateTime, nullable=False)
+    created_at = Column(DateTime, default=utcnow)
