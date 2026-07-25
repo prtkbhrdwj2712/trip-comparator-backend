@@ -8,7 +8,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
 
 from .database import init_db, get_db
-from .models import TripBaseline, StopBaseline, TripConfirmed, StopConfirmed, PendingReconfirm, DashboardUser, GeocodeCache, VehicleTransporter, DealerLocation
+from .models import TripBaseline, StopBaseline, TripConfirmed, StopConfirmed, PendingReconfirm, DashboardUser, GeocodeCache, VehicleTransporter, DealerLocation, DeviceToken
 from .xlsx_parser import parse_dispatch_workbook
 from .diff_engine import compute_diff
 from .auth import verify_api_key, verify_dashboard_key
@@ -794,6 +794,43 @@ def enable_2fa(name: str, db: Session = Depends(get_db), _auth: bool = Depends(v
     }
 
 
+@app.post("/api/setup-my-2fa")
+def setup_my_2fa(payload: dict = Body(...), db: Session = Depends(get_db)):
+    """
+    Self-service 2FA setup - any dashboard user can call this themselves
+    (proving their own name+access_key, no admin key needed) to generate
+    and see their own QR code directly, instead of needing an admin to run
+    an API call and hand them the result manually. Not protected by
+    verify_api_key/verify_dashboard_key on purpose - it does its own
+    credential check, same as /api/login.
+    """
+    name = (payload.get("name") or "").strip()
+    access_key = payload.get("access_key") or ""
+    if not name:
+        raise HTTPException(status_code=400, detail="Username is required")
+
+    user = db.get(DashboardUser, name)
+    if not user or user.revoked or not password_utils.verify_key(access_key, user.access_key):
+        raise HTTPException(status_code=401, detail="Incorrect username or access key")
+
+    if user.totp_secret:
+        raise HTTPException(
+            status_code=400,
+            detail="2FA is already enabled for this account. Ask an admin to reset it first if you need a new QR code.",
+        )
+
+    secret = totp_utils.generate_secret()
+    user.totp_secret = secret
+    db.commit()
+
+    qr_b64 = totp_utils.get_provisioning_qr_code_base64(secret, name)
+    return {
+        "name": name,
+        "totp_secret": secret,
+        "qr_code_base64": qr_b64,
+    }
+
+
 @app.post("/admin/dashboard-users/{name}/disable-2fa")
 def disable_2fa(name: str, db: Session = Depends(get_db), _auth: bool = Depends(verify_api_key)):
     user = db.get(DashboardUser, name)
@@ -805,6 +842,7 @@ def disable_2fa(name: str, db: Session = Depends(get_db), _auth: bool = Depends(
 
 
 MAX_FAILED_LOGIN_ATTEMPTS = 3
+DEVICE_TOKEN_HOURS = 12  # "remember this device" window for 2FA
 LOCKOUT_MINUTES = 15
 
 
@@ -821,6 +859,13 @@ def dashboard_login(payload: dict = Body(...), db: Session = Depends(get_db)):
     a given username, that account is temporarily locked out regardless of
     whether the next attempt would've been correct - slows down guessing.
 
+    "Remember this device" (device_token): if the browser already holds a
+    valid, unexpired token for this username, the 2FA code isn't required
+    again - the token is genuinely time-limited (DEVICE_TOKEN_HOURS from
+    when it was issued) rather than a rolling window, so it resets exactly
+    once that window passes. A fresh token is issued and returned whenever
+    a code is verified successfully, for the frontend to store client-side.
+
     This endpoint itself isn't protected by verify_dashboard_key (that would
     be circular) - it's the thing that decides whether the key the user is
     about to use for real API calls is actually valid for them.
@@ -830,6 +875,7 @@ def dashboard_login(payload: dict = Body(...), db: Session = Depends(get_db)):
     name = (payload.get("name") or "").strip()
     access_key = payload.get("access_key") or ""
     totp_code = payload.get("totp_code")
+    device_token = payload.get("device_token")
 
     if access_key == DASHBOARD_KEY:
         return {"status": "ok", "requires_totp": False}
@@ -863,12 +909,38 @@ def dashboard_login(payload: dict = Body(...), db: Session = Depends(get_db)):
     db.commit()
 
     if user.totp_secret:
-        if not totp_code:
-            # Correct username/key, but 2FA is required and no code was sent yet -
-            # the frontend should now show the code-entry step.
-            return {"status": "totp_required", "requires_totp": True}
-        if not totp_utils.verify_totp_code(user.totp_secret, totp_code):
-            raise HTTPException(status_code=401, detail="Incorrect 2FA code")
+        # Opportunistic cleanup - remove this user's expired tokens so the
+        # table doesn't grow unbounded; cheap since it's scoped to one user.
+        db.query(DeviceToken).filter(
+            DeviceToken.username == name, DeviceToken.expires_at < now,
+        ).delete()
+        db.commit()
+
+        remembered = None
+        if device_token:
+            remembered = db.query(DeviceToken).filter(
+                DeviceToken.token == device_token,
+                DeviceToken.username == name,
+                DeviceToken.expires_at > now,
+            ).first()
+
+        if not remembered:
+            if not totp_code:
+                # Correct username/key, but 2FA is required, no valid
+                # remembered device, and no code sent yet - frontend should
+                # now show the code-entry step.
+                return {"status": "totp_required", "requires_totp": True}
+            if not totp_utils.verify_totp_code(user.totp_secret, totp_code):
+                raise HTTPException(status_code=401, detail="Incorrect 2FA code")
+
+            # Code verified - issue a fresh 12-hour device token.
+            new_token = secrets.token_urlsafe(32)
+            db.add(DeviceToken(
+                token=new_token, username=name,
+                expires_at=now + timedelta(hours=DEVICE_TOKEN_HOURS),
+            ))
+            db.commit()
+            return {"status": "ok", "requires_totp": True, "device_token": new_token}
 
     return {"status": "ok", "requires_totp": bool(user.totp_secret)}
 
