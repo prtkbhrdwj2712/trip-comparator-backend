@@ -32,6 +32,23 @@ def _dealer_keys_from_stops(stops):
     return keys
 
 
+def _is_legitimate_confirmation(confirmed_trip):
+    """
+    A trip that genuinely ran always gets a real cost and a real vehicle
+    plate assigned - a null cost, or a vehicle_id still in the synthetic
+    planning-placeholder format (e.g. "1607_V735836175095877633_1" - note
+    the underscores, which no real Indian registration plate ever has),
+    means this trip never actually executed. It most likely got cancelled
+    but happened to still appear in a later poll with unchanged data,
+    which would otherwise look identical to a genuine no-changes confirmation.
+    """
+    if confirmed_trip.trip_cost is None:
+        return False
+    if confirmed_trip.vehicle_id and "_" in confirmed_trip.vehicle_id:
+        return False
+    return True
+
+
 def compute_diff(baseline_trip, confirmed_trip, baseline_stops=None, confirmed_stops=None):
     """
     baseline_trip: TripBaseline ORM instance
@@ -46,6 +63,18 @@ def compute_diff(baseline_trip, confirmed_trip, baseline_stops=None, confirmed_s
     """
     if confirmed_trip is None:
         return {"status": "awaiting_confirmation"}
+
+    if not _is_legitimate_confirmation(confirmed_trip):
+        return {
+            "status": "likely_cancelled",
+            "trip_level_diff": [],
+            "dealers_baseline_count": None,
+            "dealers_confirmed_count": None,
+            "dealers_dropped": [],
+            "dealers_added": [],
+            "baseline_total_weight_kg": baseline_trip.trip_weight_kg,
+            "confirmed_total_weight_kg": confirmed_trip.trip_weight_kg,
+        }
 
     def _norm(v):
         # Treat None and "" as the same "empty" value so a blank baseline
