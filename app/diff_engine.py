@@ -71,6 +71,10 @@ def _cpt_change_explanation(baseline_cost, baseline_weight, confirmed_cost, conf
     This builds a plain-language note naming whichever factor(s) actually
     moved, so the reason is always visible rather than something you have
     to work out by cross-referencing the cost and weight fields yourself.
+    Covers two distinct cases: CPT itself moved (name what drove it), or
+    CPT stayed flat even though cost/weight visibly changed (say so
+    explicitly - proportional movement is itself a real, useful fact, not
+    something to go silent about).
     """
     cost_changed = baseline_cost is not None and confirmed_cost is not None and baseline_cost != confirmed_cost
     weight_changed = bool(baseline_weight) and bool(confirmed_weight) and baseline_weight != confirmed_weight
@@ -83,6 +87,18 @@ def _cpt_change_explanation(baseline_cost, baseline_weight, confirmed_cost, conf
         parts.append(f"weight {baseline_weight:g}kg → {confirmed_weight:g}kg")
     if cost_changed:
         parts.append(f"cost ₹{baseline_cost:g} → ₹{confirmed_cost:g}")
+
+    baseline_cpt = _compute_cpt(baseline_cost, baseline_weight)
+    confirmed_cpt = _compute_cpt(confirmed_cost, confirmed_weight)
+    cpt_actually_changed = (
+        baseline_cpt is not None and confirmed_cpt is not None
+        and round(baseline_cpt, 2) != round(confirmed_cpt, 2)
+    )
+
+    if not cpt_actually_changed:
+        # Cost and/or weight moved, but proportionally - CPT stayed flat.
+        # Worth stating plainly rather than leaving it unexplained.
+        return f"CPT unchanged even though {' and '.join(parts)} - they moved proportionally"
 
     if cost_changed and weight_changed:
         driver = "both cost and weight changing"
@@ -201,18 +217,29 @@ def compute_diff(baseline_trip, confirmed_trip, baseline_stops=None, confirmed_s
 
     baseline_cpt = _compute_cpt(baseline_trip.trip_cost, baseline_trip.trip_weight_kg)
     confirmed_cpt = _compute_cpt(confirmed_trip.trip_cost, confirmed_trip.trip_weight_kg)
-    if baseline_cpt is not None and confirmed_cpt is not None and round(baseline_cpt, 2) != round(confirmed_cpt, 2):
+    cpt_explanation = _cpt_change_explanation(
+        baseline_trip.trip_cost, baseline_trip.trip_weight_kg,
+        confirmed_trip.trip_cost, confirmed_trip.trip_weight_kg,
+    )
+    if cpt_explanation is not None:
+        # Note: this fires whenever cost and/or weight changed at all - even
+        # if CPT itself stayed flat (proportional movement). cpt_value_changed
+        # is tracked separately so callers can distinguish "CPT actually
+        # moved" from "cost/weight moved but cancelled out" for styling.
+        cpt_value_changed = (
+            baseline_cpt is not None and confirmed_cpt is not None
+            and round(baseline_cpt, 2) != round(confirmed_cpt, 2)
+        )
         trip_diffs.append({
             "field": "cost_per_ton",
             "label": "Cost per Ton",
-            "planned": round(baseline_cpt, 2),
-            "confirmed": round(confirmed_cpt, 2),
-            "explanation": _cpt_change_explanation(
-                baseline_trip.trip_cost, baseline_trip.trip_weight_kg,
-                confirmed_trip.trip_cost, confirmed_trip.trip_weight_kg,
-            ),
+            "planned": round(baseline_cpt, 2) if baseline_cpt is not None else None,
+            "confirmed": round(confirmed_cpt, 2) if confirmed_cpt is not None else None,
+            "explanation": cpt_explanation,
+            "cpt_value_changed": cpt_value_changed,
         })
-        has_changes = True
+        if cpt_value_changed:
+            has_changes = True
 
     return {
         "status": "confirmed_with_changes" if has_changes else "confirmed_no_changes",
