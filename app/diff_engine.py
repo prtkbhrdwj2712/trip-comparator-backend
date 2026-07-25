@@ -9,8 +9,10 @@ from datetime import datetime, timezone, timedelta
 # treat it as merely "awaiting" - matches GIVE_UP_AFTER_HOURS in main.py,
 # where the polling system itself stops checking. Once polling has given
 # up with zero confirmation ever appearing, the trip is presumed cancelled
-# rather than left in permanent limbo.
-UNCONFIRMED_CANCELLATION_HOURS = 24
+# rather than left in permanent limbo. 13 hours is the real maximum a plan
+# stays in its lifecycle end-to-end - anything still unconfirmed past that
+# genuinely won't be confirmed at all.
+UNCONFIRMED_CANCELLATION_HOURS = 13
 
 TRIP_LEVEL_FIELDS = [
     # (baseline_field, confirmed_field, label) - baseline_field == confirmed_field
@@ -144,11 +146,15 @@ def compute_diff(baseline_trip, confirmed_trip, baseline_stops=None, confirmed_s
         single-trip lookups like /api/trips/{trip_id}).
     """
     if confirmed_trip is None:
-        received_at = baseline_trip.received_at
-        if received_at is not None:
-            if received_at.tzinfo is None:
-                received_at = received_at.replace(tzinfo=timezone.utc)
-            age = datetime.now(timezone.utc) - received_at
+        # Prefer the real plan creation time (from Mojro's own webhook) -
+        # only fall back to our own ingestion timestamp for older trips
+        # baselined before this field existed, since our ingestion time is
+        # just a proxy and can run a bit later than the true creation time.
+        reference_time = baseline_trip.plan_created_at or baseline_trip.received_at
+        if reference_time is not None:
+            if reference_time.tzinfo is None:
+                reference_time = reference_time.replace(tzinfo=timezone.utc)
+            age = datetime.now(timezone.utc) - reference_time
             if age > timedelta(hours=UNCONFIRMED_CANCELLATION_HOURS):
                 return {"status": "cancelled"}
         return {"status": "awaiting_confirmation"}
