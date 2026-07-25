@@ -42,6 +42,7 @@ def on_startup():
 async def receive_plan_baseline(
     file: UploadFile = File(...),
     hierarchy: str = Form(None),  # e.g. "Bhandup" - the friendly DC name, passed by the uploader
+    plan_created_at: str = Form(None),  # Mojro's real plan creation time (data.createdAt), ISO format
     db: Session = Depends(get_db),
     _auth: bool = Depends(verify_api_key),
 ):
@@ -50,6 +51,23 @@ async def receive_plan_baseline(
         trips = parse_dispatch_workbook(io.BytesIO(content))
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Could not parse workbook: {e}")
+
+    parsed_plan_created_at = None
+    if plan_created_at:
+        try:
+            parsed_plan_created_at = datetime.fromisoformat(plan_created_at)
+            if parsed_plan_created_at.tzinfo is not None:
+                # Mojro sends this with its own offset (e.g. +05:30 for IST) -
+                # convert to true UTC before storing, then drop the tzinfo
+                # marker so it's stored the same naive-but-UTC way as
+                # received_at/confirmed_at elsewhere. Skipping this step
+                # would silently treat "16:52 IST" as if it were "16:52 UTC" -
+                # a 5.5-hour error that would cancel plans hours too early.
+                parsed_plan_created_at = parsed_plan_created_at.astimezone(timezone.utc).replace(tzinfo=None)
+        except (ValueError, TypeError):
+            # Malformed/unexpected format - don't fail the whole ingestion
+            # over a timestamp we can fall back to received_at for anyway.
+            parsed_plan_created_at = None
 
     upserted = []
     skipped_existing = []
@@ -71,6 +89,7 @@ async def receive_plan_baseline(
             trip_name=t.get("trip_name"),
             trip_date=t.get("trip_date"),
             dc_name=hierarchy,
+            plan_created_at=parsed_plan_created_at,
             vehicle_category=t.get("vehicle_category"),
             vehicle_id=t.get("vehicle_id"),
             driver_name=t.get("driver_name"),
@@ -257,6 +276,7 @@ def list_trips(
             "trip_date": b.trip_date,
             "dc_name": b.dc_name,
             "baseline_unavailable": bool(b.baseline_unavailable),
+            "plan_created_at": b.plan_created_at.isoformat() if b.plan_created_at else None,
             **diff,
         })
     return out
@@ -393,6 +413,7 @@ def get_trip(trip_id: str, db: Session = Depends(get_db), _auth: bool = Depends(
         "trip_name": b.trip_name,
         "dc_name": b.dc_name,
         "baseline_unavailable": bool(b.baseline_unavailable),
+        "plan_created_at": b.plan_created_at.isoformat() if b.plan_created_at else None,
         "baseline": {
             "vehicle_category": b.vehicle_category,
             "vehicle_id": b.vehicle_id,
@@ -1093,6 +1114,14 @@ async def receive_plan_reconfirm(
     sibling_dc_row = db.query(TripBaseline.dc_name).filter(TripBaseline.plan_id == plan_id).first()
     plan_dc_name = sibling_dc_row[0] if sibling_dc_row else None
 
+    # Same idea for plan_created_at - a late-discovered trip belongs to the
+    # same plan as its siblings, so it shares the same real creation time,
+    # even though we never saw the original webhook for THIS trip specifically.
+    sibling_created_row = db.query(TripBaseline.plan_created_at).filter(
+        TripBaseline.plan_id == plan_id, TripBaseline.plan_created_at.isnot(None),
+    ).first()
+    plan_created_at_for_siblings = sibling_created_row[0] if sibling_created_row else None
+
     newly_confirmed = []
     newly_discovered = []
 
@@ -1114,6 +1143,7 @@ async def receive_plan_reconfirm(
                 trip_date=t.get("trip_date"),
                 dc_name=plan_dc_name,
                 baseline_unavailable=1,
+                plan_created_at=plan_created_at_for_siblings,
                 vehicle_category=t.get("vehicle_category"),
                 vehicle_id=t.get("vehicle_id"),
                 driver_name=t.get("driver_name"),
