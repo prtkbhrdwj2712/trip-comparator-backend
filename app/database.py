@@ -63,6 +63,15 @@ def _run_migrations():
             if "locked_until" not in cols:
                 conn.execute(text("ALTER TABLE dashboard_user ADD COLUMN locked_until TIMESTAMP"))
 
+        # CREATE INDEX IF NOT EXISTS works identically on both Postgres and
+        # SQLite, so this doesn't need is_postgres branching. Added because
+        # dealer-code and order-reference search scan these columns directly
+        # with no index at all otherwise - a full table scan on every search.
+        conn.execute(text("CREATE INDEX IF NOT EXISTS ix_stop_baseline_ship_to_code ON stop_baseline (ship_to_code)"))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS ix_stop_confirmed_ship_to_code ON stop_confirmed (ship_to_code)"))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS ix_stop_baseline_ref_order_num ON stop_baseline (reference_order_number)"))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS ix_stop_confirmed_ref_order_num ON stop_confirmed (reference_order_number)"))
+
     _migrate_plaintext_keys_to_hashed()
 
 
