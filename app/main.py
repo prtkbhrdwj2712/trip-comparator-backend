@@ -1,5 +1,6 @@
 import io
 import json
+import os
 import secrets
 from datetime import datetime, timezone, timedelta
 
@@ -202,6 +203,7 @@ def list_trips(
     dc: str = None,          # exact dc_name match, e.g. "Bhandup"
     plan_id: str = None,     # partial, case-insensitive match
     trip_id: str = None,     # partial, case-insensitive match
+    dealer_code: str = None,  # exact dealer code - finds every trip that dealer is part of
     db: Session = Depends(get_db),
     _auth: bool = Depends(verify_dashboard_key),
 ):
@@ -219,6 +221,21 @@ def list_trips(
         query = query.filter(TripBaseline.plan_id.ilike(f"%{plan_id}%"))
     if trip_id:
         query = query.filter(TripBaseline.trip_id.ilike(f"%{trip_id}%"))
+    if dealer_code:
+        # Check both baseline and confirmed stops - a dealer could have been
+        # ADDED only during confirmation (dealers_added), so it might only
+        # appear in StopConfirmed for that specific trip, not the original
+        # baseline plan.
+        baseline_trip_ids = {
+            r[0] for r in db.query(StopBaseline.trip_id).filter(StopBaseline.ship_to_code == dealer_code).all()
+        }
+        confirmed_trip_ids = {
+            r[0] for r in db.query(StopConfirmed.trip_id).filter(StopConfirmed.ship_to_code == dealer_code).all()
+        }
+        matching_trip_ids = baseline_trip_ids | confirmed_trip_ids
+        if not matching_trip_ids:
+            return []
+        query = query.filter(TripBaseline.trip_id.in_(matching_trip_ids))
 
     baselines = query.all()
     if not baselines:
@@ -866,6 +883,16 @@ def disable_2fa(name: str, db: Session = Depends(get_db), _auth: bool = Depends(
 
 MAX_FAILED_LOGIN_ATTEMPTS = 3
 DEVICE_TOKEN_HOURS = 12  # "remember this device" window for 2FA
+
+
+def _2fa_globally_disabled():
+    """
+    Temporary kill switch: set DISABLE_2FA=true on Render to stop enforcing
+    2FA for everyone, without touching anyone's stored totp_secret - so
+    turning it back on later just requires flipping this env var back,
+    not asking anyone to redo their QR code setup.
+    """
+    return os.environ.get("DISABLE_2FA", "").lower() in ("true", "1", "yes")
 LOCKOUT_MINUTES = 15
 
 
@@ -931,7 +958,7 @@ def dashboard_login(payload: dict = Body(...), db: Session = Depends(get_db)):
     user.locked_until = None
     db.commit()
 
-    if user.totp_secret:
+    if user.totp_secret and not _2fa_globally_disabled():
         # Opportunistic cleanup - remove this user's expired tokens so the
         # table doesn't grow unbounded; cheap since it's scoped to one user.
         db.query(DeviceToken).filter(
@@ -965,7 +992,7 @@ def dashboard_login(payload: dict = Body(...), db: Session = Depends(get_db)):
             db.commit()
             return {"status": "ok", "requires_totp": True, "device_token": new_token}
 
-    return {"status": "ok", "requires_totp": bool(user.totp_secret)}
+    return {"status": "ok", "requires_totp": bool(user.totp_secret) and not _2fa_globally_disabled()}
 
 
 
