@@ -1104,7 +1104,15 @@ def backfill_pending_reconfirm(db: Session = Depends(get_db), _auth: bool = Depe
 @app.get("/internal/due-reconfirms")
 def due_reconfirms(db: Session = Depends(get_db), _auth: bool = Depends(verify_api_key)):
     now = datetime.now(timezone.utc)
-    candidates = db.query(PendingReconfirm).filter(PendingReconfirm.done == 0).all()
+    # Oldest first - without this, plans came back in arbitrary DB order,
+    # meaning a plan close to the 24h give-up point had no guarantee of
+    # being checked before less-urgent ones, even with plenty of throughput.
+    candidates = (
+        db.query(PendingReconfirm)
+        .filter(PendingReconfirm.done == 0)
+        .order_by(PendingReconfirm.first_downloaded_at.asc())
+        .all()
+    )
 
     due = []
     for p in candidates:
