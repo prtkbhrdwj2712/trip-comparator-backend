@@ -68,11 +68,11 @@ class StopBaseline(Base):
     trip_id = Column(String, ForeignKey("trip_baseline.trip_id"), index=True)
 
     activity = Column(String)          # Pickup / Drop
-    ship_to_code = Column(String)      # dealer code -> used for the dealer diff
+    ship_to_code = Column(String, index=True)      # dealer code -> used for the dealer diff and dealer search
     ship_to_name = Column(String)
     sequence = Column(Float)
     planned_arrival = Column(String)
-    reference_order_number = Column(String, nullable=True)
+    reference_order_number = Column(String, nullable=True, index=True)
     address = Column(String, nullable=True)  # for geocoding into the route map
     weight_kg = Column(Float)
 
@@ -116,11 +116,11 @@ class StopConfirmed(Base):
     trip_id = Column(String, ForeignKey("trip_confirmed.trip_id"), index=True)
 
     activity = Column(String)
-    ship_to_code = Column(String)
+    ship_to_code = Column(String, index=True)
     ship_to_name = Column(String)
     sequence = Column(Float)
     actual_arrival = Column(String)
-    reference_order_number = Column(String, nullable=True)
+    reference_order_number = Column(String, nullable=True, index=True)
     address = Column(String, nullable=True)  # for geocoding into the route map
     weight_kg = Column(Float)
 
