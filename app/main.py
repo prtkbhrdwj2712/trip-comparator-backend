@@ -1124,6 +1124,41 @@ def due_reconfirms(db: Session = Depends(get_db), _auth: bool = Depends(verify_a
     return {"due": due}
 
 
+@app.get("/api/backlog-status")
+def backlog_status(db: Session = Depends(get_db), _auth: bool = Depends(verify_dashboard_key)):
+    """
+    Lightweight, dashboard-facing view of the reconfirm backlog - just a
+    count and the oldest due plan's age, not the full list (that's what
+    /internal/due-reconfirms is for). Exists so a growing backlog can be
+    noticed proactively on the dashboard itself, rather than only showing
+    up as "why isn't my trip confirmed yet" reports after the fact.
+    """
+    now = datetime.now(timezone.utc)
+    candidates = db.query(PendingReconfirm).filter(PendingReconfirm.done == 0).all()
+
+    due_count = 0
+    oldest_due_age_minutes = None
+    for p in candidates:
+        first_dl = _as_utc(p.first_downloaded_at)
+        if now - first_dl < timedelta(minutes=FIRST_CHECK_DELAY_MINUTES):
+            continue
+        if now - first_dl > timedelta(hours=GIVE_UP_AFTER_HOURS):
+            continue  # already given up, not a meaningful part of the "backlog"
+        if p.last_checked_at is not None:
+            last = _as_utc(p.last_checked_at)
+            if now - last < timedelta(minutes=RECHECK_INTERVAL_MINUTES):
+                continue
+        due_count += 1
+        age = (now - first_dl).total_seconds() / 60
+        if oldest_due_age_minutes is None or age > oldest_due_age_minutes:
+            oldest_due_age_minutes = age
+
+    return {
+        "due_count": due_count,
+        "oldest_due_age_minutes": round(oldest_due_age_minutes) if oldest_due_age_minutes is not None else None,
+    }
+
+
 @app.post("/webhooks/plan-reconfirm")
 async def receive_plan_reconfirm(
     plan_id: str = Form(...),
