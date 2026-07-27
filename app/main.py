@@ -204,6 +204,7 @@ def list_trips(
     plan_id: str = None,     # partial, case-insensitive match
     trip_id: str = None,     # partial, case-insensitive match
     dealer_code: str = None,  # exact dealer code - finds every trip that dealer is part of
+    order_ref: str = None,  # partial match on order reference number (can be comma-joined per stop)
     db: Session = Depends(get_db),
     _auth: bool = Depends(verify_dashboard_key),
 ):
@@ -231,6 +232,21 @@ def list_trips(
         }
         confirmed_trip_ids = {
             r[0] for r in db.query(StopConfirmed.trip_id).filter(StopConfirmed.ship_to_code == dealer_code).all()
+        }
+        matching_trip_ids = baseline_trip_ids | confirmed_trip_ids
+        if not matching_trip_ids:
+            return []
+        query = query.filter(TripBaseline.trip_id.in_(matching_trip_ids))
+    if order_ref:
+        # reference_order_number can hold several orders comma-joined in one
+        # stop, so this needs a partial (contains) match, not exact equality.
+        baseline_trip_ids = {
+            r[0] for r in db.query(StopBaseline.trip_id)
+            .filter(StopBaseline.reference_order_number.ilike(f"%{order_ref}%")).all()
+        }
+        confirmed_trip_ids = {
+            r[0] for r in db.query(StopConfirmed.trip_id)
+            .filter(StopConfirmed.reference_order_number.ilike(f"%{order_ref}%")).all()
         }
         matching_trip_ids = baseline_trip_ids | confirmed_trip_ids
         if not matching_trip_ids:
