@@ -59,6 +59,10 @@ def _is_legitimate_confirmation(confirmed_trip):
     return True
 
 
+def _is_placeholder_vehicle_id(vehicle_id):
+    return bool(vehicle_id) and "_" in vehicle_id
+
+
 def _compute_cpt(cost, weight_kg):
     """Cost per ton = cost / (weight_kg / 1000). None if not computable (missing cost, or zero/missing weight)."""
     if cost is None or not weight_kg:
