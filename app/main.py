@@ -11,7 +11,7 @@ from sqlalchemy.orm import Session
 from .database import init_db, get_db
 from .models import TripBaseline, StopBaseline, TripConfirmed, StopConfirmed, PendingReconfirm, DashboardUser, GeocodeCache, VehicleTransporter, DealerLocation, DeviceToken
 from .xlsx_parser import parse_dispatch_workbook
-from .diff_engine import compute_diff
+from .diff_engine import compute_diff, _is_placeholder_vehicle_id
 from .auth import verify_api_key, verify_dashboard_key
 from . import totp_utils
 from . import password_utils
@@ -294,6 +294,21 @@ def list_trips(
     else:
         confirmed_stops_by_trip = {}
 
+    # Bulk-fetch transporter lookups for every vehicle_id appearing in this
+    # result set (both baseline and confirmed sides), in ONE query - same
+    # N+1 avoidance pattern as the stops above, needed for vehicle_edited.
+    all_vehicle_ids = set()
+    for b in baselines:
+        if b.vehicle_id:
+            all_vehicle_ids.add(b.vehicle_id)
+    for c in confirmed_rows:
+        if c.vehicle_id:
+            all_vehicle_ids.add(c.vehicle_id)
+    transporter_by_vehicle = {}
+    if all_vehicle_ids:
+        rows = db.query(VehicleTransporter).filter(VehicleTransporter.vehicle_id.in_(all_vehicle_ids)).all()
+        transporter_by_vehicle = {r.vehicle_id: r.transporter_name for r in rows}
+
     out = []
     for b in baselines:
         confirmed = confirmed_by_id.get(b.trip_id)
@@ -302,6 +317,19 @@ def list_trips(
             baseline_stops=baseline_stops_by_trip.get(b.trip_id, []) if confirmed else None,
             confirmed_stops=confirmed_stops_by_trip.get(b.trip_id, []) if confirmed else None,
         )
+
+        vehicle_edited = False
+        if confirmed:
+            baseline_transporter = transporter_by_vehicle.get(b.vehicle_id) if b.vehicle_id else None
+            confirmed_transporter = transporter_by_vehicle.get(confirmed.vehicle_id) if confirmed.vehicle_id else None
+            vehicle_edited = (
+                _is_placeholder_vehicle_id(b.vehicle_id)
+                and bool(confirmed.vehicle_id) and not _is_placeholder_vehicle_id(confirmed.vehicle_id)
+                and baseline_transporter is None and confirmed_transporter is not None
+                and b.trip_cost is None and confirmed.trip_cost is not None
+            )
+        diff["vehicle_edited"] = vehicle_edited
+
         out.append({
             "trip_id": b.trip_id,
             "plan_id": b.plan_id,
@@ -418,6 +446,57 @@ def pending_reconfirm_status(plan_id: str, db: Session = Depends(get_db), _auth:
     }
 
 
+def _annotate_cross_trip_dealer_movement(db, trip_id, plan_id, diff):
+    """
+    A dealer dropped from one trip and added to a sibling trip in the same
+    plan isn't really "removed" - it was reassigned to a different vehicle
+    during execution. Without this, dealers_dropped/dealers_added on each
+    trip look like independent, disconnected changes, when they're often
+    really one movement visible from two sides. Only meaningful for trips
+    that actually have dealer changes, so this is skipped otherwise to
+    avoid the cost of loading sibling data for every trip view.
+    """
+    dropped = diff.get("dealers_dropped") or []
+    added = diff.get("dealers_added") or []
+    if not dropped and not added:
+        return
+
+    sibling_ids = [
+        row.trip_id for row in db.query(TripBaseline.trip_id)
+        .filter(TripBaseline.plan_id == plan_id, TripBaseline.trip_id != trip_id)
+        .all()
+    ]
+    if not sibling_ids:
+        return
+
+    # For each sibling with a confirmed record, compute its own diff just to
+    # get its dealers_added/dealers_dropped - build a code -> (trip_id, trip_name)
+    # lookup covering every dealer that moved on any sibling.
+    sibling_added_by_code = {}    # dealer code -> sibling trip that ADDED it
+    sibling_dropped_by_code = {}  # dealer code -> sibling trip that DROPPED it
+
+    siblings = db.query(TripBaseline).filter(TripBaseline.trip_id.in_(sibling_ids)).all()
+    for sib in siblings:
+        sib_confirmed = db.get(TripConfirmed, sib.trip_id)
+        if not sib_confirmed:
+            continue  # no confirmed data yet - nothing to cross-reference
+        sib_diff = compute_diff(sib, sib_confirmed)
+        for d in (sib_diff.get("dealers_added") or []):
+            sibling_added_by_code[d["code"]] = (sib.trip_id, sib.trip_name)
+        for d in (sib_diff.get("dealers_dropped") or []):
+            sibling_dropped_by_code[d["code"]] = (sib.trip_id, sib.trip_name)
+
+    for d in dropped:
+        match = sibling_added_by_code.get(d["code"])
+        if match:
+            d["moved_to_trip_id"], d["moved_to_trip_name"] = match
+
+    for d in added:
+        match = sibling_dropped_by_code.get(d["code"])
+        if match:
+            d["moved_from_trip_id"], d["moved_from_trip_name"] = match
+
+
 @app.get("/api/trips/{trip_id}")
 def get_trip(trip_id: str, db: Session = Depends(get_db), _auth: bool = Depends(verify_dashboard_key)):
     b = db.get(TripBaseline, trip_id)
@@ -425,6 +504,7 @@ def get_trip(trip_id: str, db: Session = Depends(get_db), _auth: bool = Depends(
         raise HTTPException(status_code=404, detail="Trip not found in baseline")
     confirmed = db.get(TripConfirmed, trip_id)
     diff = compute_diff(b, confirmed)
+    _annotate_cross_trip_dealer_movement(db, trip_id, b.plan_id, diff)
 
     # Transporter isn't in the dispatch summary data at all - looked up
     # separately from the vehicle_transporter table, maintained via
@@ -439,6 +519,22 @@ def get_trip(trip_id: str, db: Session = Depends(get_db), _auth: bool = Depends(
     if confirmed and confirmed.vehicle_id:
         vt = db.get(VehicleTransporter, confirmed.vehicle_id)
         confirmed_transporter = vt.transporter_name if vt else None
+
+    # A trip that gets planned before a real vehicle/transporter/cost is
+    # assigned (baseline carries a synthetic placeholder + nulls) and has
+    # all three filled in with real values by confirmation time is a
+    # normal, expected event worth flagging distinctly - not the same as
+    # the "likely_cancelled" suspicious-data heuristic, which looks for the
+    # opposite pattern on the CONFIRMED side.
+    vehicle_edited = False
+    if confirmed:
+        vehicle_edited = (
+            _is_placeholder_vehicle_id(b.vehicle_id)
+            and bool(confirmed.vehicle_id) and not _is_placeholder_vehicle_id(confirmed.vehicle_id)
+            and baseline_transporter is None and confirmed_transporter is not None
+            and b.trip_cost is None and confirmed.trip_cost is not None
+        )
+    diff["vehicle_edited"] = vehicle_edited
 
     return {
         "trip_id": trip_id,
