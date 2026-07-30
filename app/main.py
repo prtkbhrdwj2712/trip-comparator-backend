@@ -312,11 +312,19 @@ def list_trips(
     out = []
     for b in baselines:
         confirmed = confirmed_by_id.get(b.trip_id)
-        diff = compute_diff(
-            b, confirmed,
-            baseline_stops=baseline_stops_by_trip.get(b.trip_id, []) if confirmed else None,
-            confirmed_stops=confirmed_stops_by_trip.get(b.trip_id, []) if confirmed else None,
-        )
+        if confirmed and confirmed.cached_diff_json:
+            diff = confirmed.cached_diff_json
+        else:
+            diff = compute_diff(
+                b, confirmed,
+                baseline_stops=baseline_stops_by_trip.get(b.trip_id, []) if confirmed else None,
+                confirmed_stops=confirmed_stops_by_trip.get(b.trip_id, []) if confirmed else None,
+            )
+            # Opportunistically backfill the cache for historical trips
+            # confirmed before this feature existed, so subsequent calls
+            # for the SAME trip hit the fast path from here on.
+            if confirmed:
+                confirmed.cached_diff_json = diff
 
         vehicle_edited = False
         if confirmed:
@@ -340,6 +348,7 @@ def list_trips(
             "plan_created_at": b.plan_created_at.isoformat() if b.plan_created_at else None,
             **diff,
         })
+    db.commit()  # persist any opportunistic cache backfills from historical trips above
     return out
 
 
@@ -1398,6 +1407,20 @@ async def receive_plan_reconfirm(
                 address=s.get("address"),
                 weight_kg=_to_float(s.get("weight_kg")),
             ))
+        db.flush()
+
+        # Cache the diff right now, at the one moment we know for certain
+        # this data just changed - list_trips can then reuse this instead of
+        # recomputing the same result fresh on every single page load. Only
+        # trips reaching a confirmed state get cached; awaiting/cancelled
+        # trips are still computed live, since those results can genuinely
+        # still change (a later check might confirm them, or the 13h/24h
+        # clocks keep ticking).
+        baseline_obj = db.get(TripBaseline, trip_id)
+        if baseline_obj:
+            fresh_diff = compute_diff(baseline_obj, row)
+            row.cached_diff_json = fresh_diff
+
         newly_confirmed.append(trip_id)
 
     still_planned = sorted(baseline_trip_ids - set(newly_confirmed) - {
