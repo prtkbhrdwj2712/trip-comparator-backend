@@ -1117,8 +1117,8 @@ def dashboard_login(payload: dict = Body(...), db: Session = Depends(get_db)):
 #      c) that job re-downloads the plan and posts it to /webhooks/plan-reconfirm
 #      d) we only treat a trip as confirmed if its own `status` column says so
 # ---------------------------------------------------------------------------
-RECHECK_INTERVAL_MINUTES = 15   # don't re-check the same plan more than this often
-FIRST_CHECK_DELAY_MINUTES = 60  # don't bother checking until this long after baseline
+RECHECK_INTERVAL_MINUTES = 60   # don't re-check the same plan more than this often
+FIRST_CHECK_DELAY_MINUTES = 30  # don't bother checking until this long after baseline
 GIVE_UP_AFTER_HOURS = 24        # stop rechecking a plan after this long either way
 
 
