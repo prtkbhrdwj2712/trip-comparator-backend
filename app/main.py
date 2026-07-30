@@ -827,6 +827,80 @@ def get_trip_map_data(trip_id: str, db: Session = Depends(get_db), _auth: bool =
     }
 
 
+@app.get("/api/dc-map-data")
+def get_dc_map_data(dc_name: str, date: str, db: Session = Depends(get_db), _auth: bool = Depends(verify_dashboard_key)):
+    """
+    Whole-DC version of get_trip_map_data - every trip's baseline and
+    confirmed route points for a given DC and day, in one response, so a
+    map can show all of that day's routes at once instead of one trip at
+    a time. Bulk-fetches stops and dealer locations up front (same N+1
+    avoidance pattern as list_trips) rather than repeating the single-trip
+    endpoint's per-trip DealerLocation lookups across what could be dozens
+    of trips in one DC/day.
+
+    Deliberately does NOT fall back to free-text Nominatim geocoding here -
+    only dealers with better real coordinates (DealerLocation table) get
+    plotted. Doing live geocoding across many trips at once would hit
+    Nominatim's 1-request/second cap hard on any DC/day with several
+    never-before-seen addresses, making this endpoint unpredictably slow.
+    The single-trip map endpoint still does full geocoding-with-fallback
+    when someone drills into one specific trip.
+    """
+    baselines = db.query(TripBaseline).filter(
+        TripBaseline.dc_name == dc_name, TripBaseline.trip_date == date
+    ).all()
+    if not baselines:
+        return {"trips": {}}
+
+    trip_ids = [b.trip_id for b in baselines]
+    confirmed_rows = db.query(TripConfirmed).filter(TripConfirmed.trip_id.in_(trip_ids)).all()
+    confirmed_by_id = {c.trip_id: c for c in confirmed_rows}
+
+    baseline_stops = db.query(StopBaseline).filter(StopBaseline.trip_id.in_(trip_ids), StopBaseline.activity == "Drop").all()
+    confirmed_stops = db.query(StopConfirmed).filter(StopConfirmed.trip_id.in_(trip_ids), StopConfirmed.activity == "Drop").all()
+
+    baseline_stops_by_trip = {}
+    for s in baseline_stops:
+        baseline_stops_by_trip.setdefault(s.trip_id, []).append(s)
+    confirmed_stops_by_trip = {}
+    for s in confirmed_stops:
+        confirmed_stops_by_trip.setdefault(s.trip_id, []).append(s)
+
+    all_dealer_codes = {s.ship_to_code for s in baseline_stops + confirmed_stops if s.ship_to_code}
+    dealer_locations = {}
+    if all_dealer_codes:
+        rows = db.query(DealerLocation).filter(DealerLocation.dealer_code.in_(all_dealer_codes)).all()
+        dealer_locations = {r.dealer_code: r for r in rows}
+
+    def resolve_points(stops):
+        points = []
+        for s in stops:
+            loc = dealer_locations.get(s.ship_to_code) if s.ship_to_code else None
+            if not loc:
+                continue  # no authoritative coordinate - skip rather than geocode live
+            points.append({
+                "code": s.ship_to_code, "name": s.ship_to_name,
+                "sequence": s.sequence, "lat": loc.latitude, "lng": loc.longitude,
+            })
+        points.sort(key=lambda p: p["sequence"] or 0)
+        return points
+
+    trips_out = {}
+    for b in baselines:
+        confirmed = confirmed_by_id.get(b.trip_id)
+        trips_out[b.trip_id] = {
+            "trip_name": b.trip_name,
+            "baseline": resolve_points(baseline_stops_by_trip.get(b.trip_id, [])),
+            "actual": resolve_points(confirmed_stops_by_trip.get(b.trip_id, [])) if confirmed else [],
+            "baseline_weight_pct": b.weight_utilization,
+            "actual_weight_pct": confirmed.weight_utilization if confirmed else None,
+            "baseline_vehicle_category": b.vehicle_category,
+            "actual_vehicle_category": confirmed.vehicle_category if confirmed else None,
+        }
+
+    return {"trips": trips_out}
+
+
 @app.delete("/admin/trips/{trip_id}")
 def reset_trip(trip_id: str, db: Session = Depends(get_db), _auth: bool = Depends(verify_api_key)):
     """
