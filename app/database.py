@@ -36,6 +36,7 @@ def _run_migrations():
             conn.execute(text("ALTER TABLE dashboard_user ADD COLUMN IF NOT EXISTS totp_secret VARCHAR"))
             conn.execute(text("ALTER TABLE dashboard_user ADD COLUMN IF NOT EXISTS failed_login_attempts INTEGER DEFAULT 0"))
             conn.execute(text("ALTER TABLE dashboard_user ADD COLUMN IF NOT EXISTS locked_until TIMESTAMP"))
+            conn.execute(text("ALTER TABLE trip_confirmed ADD COLUMN IF NOT EXISTS cached_diff_json JSON"))
         else:
             # SQLite has no "IF NOT EXISTS" for ADD COLUMN - check first.
             cols = [row[1] for row in conn.execute(text("PRAGMA table_info(trip_baseline)"))]
@@ -62,6 +63,9 @@ def _run_migrations():
                 conn.execute(text("ALTER TABLE dashboard_user ADD COLUMN failed_login_attempts INTEGER DEFAULT 0"))
             if "locked_until" not in cols:
                 conn.execute(text("ALTER TABLE dashboard_user ADD COLUMN locked_until TIMESTAMP"))
+            cols = [row[1] for row in conn.execute(text("PRAGMA table_info(trip_confirmed)"))]
+            if "cached_diff_json" not in cols:
+                conn.execute(text("ALTER TABLE trip_confirmed ADD COLUMN cached_diff_json JSON"))
 
         # CREATE INDEX IF NOT EXISTS works identically on both Postgres and
         # SQLite, so this doesn't need is_postgres branching. Added because
