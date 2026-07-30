@@ -393,6 +393,33 @@ def get_stats(db: Session = Depends(get_db), _auth: bool = Depends(verify_dashbo
     }
 
 
+@app.get("/internal/trip-plan-info/{trip_id}")
+def trip_plan_info(trip_id: str, db: Session = Depends(get_db), _auth: bool = Depends(verify_api_key)):
+    """
+    Resolves a trip_id to the plan_id/hierarchy/hierarchy_id needed to
+    actually re-download it from Mojro. Used by the force-recheck flow -
+    someone looking at a suspicious "Likely Cancelled" trip on the
+    dashboard naturally thinks in terms of the trip_id they're looking at,
+    but the uploader (which owns Mojro API access) needs plan-level info
+    to make the actual call.
+    """
+    b = db.get(TripBaseline, trip_id)
+    if not b:
+        raise HTTPException(status_code=404, detail="Trip not found in baseline")
+    tracker = db.get(PendingReconfirm, b.plan_id)
+    if not tracker:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Plan {b.plan_id} was never registered for polling - no hierarchy_id on file for it.",
+        )
+    return {
+        "trip_id": trip_id,
+        "plan_id": b.plan_id,
+        "hierarchy": tracker.hierarchy,
+        "hierarchy_id": tracker.hierarchy_id,
+    }
+
+
 @app.get("/internal/pending-reconfirm-status/{plan_id}")
 def pending_reconfirm_status(plan_id: str, db: Session = Depends(get_db), _auth: bool = Depends(verify_api_key)):
     """
