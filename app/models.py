@@ -85,6 +85,12 @@ class TripConfirmed(Base):
     trip_id = Column(String, primary_key=True)
     plan_id = Column(String, index=True, nullable=True)
     event_type = Column(String)  # Trip Confirmed / Trip Started / Trip Completed
+    cached_diff_json = Column(JSON, nullable=True)  # compute_diff() result, cached at write time -
+        # a confirmed trip's diff can never change once written (baseline is write-once, and this
+        # row itself only gets replaced wholesale, never partially updated), so recomputing it fresh
+        # on every single list_trips call for every trip was pure wasted CPU. Written the moment this
+        # row is created/replaced; only trips still awaiting confirmation get computed live, since
+        # those are the only ones whose result can genuinely still change.
 
     vehicle_category = Column(String)
     vehicle_id = Column(String)
